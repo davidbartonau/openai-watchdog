@@ -177,6 +177,25 @@ class WatchdogDB:
     def rolling_cost_daily(self, group_name: str) -> float:
         return self.rolling_cost(group_name, 86400)
 
+    def total_rolling_cost(self, window_seconds: int) -> float:
+        """Sum of cost_usd across ALL groups within the last *window_seconds*."""
+        cutoff = int(time.time()) - window_seconds
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_records "
+            "WHERE poll_ts >= ?",
+            (cutoff,),
+        ).fetchone()
+        return row[0]
+
+    def interval_cost(self, poll_ts: int) -> float:
+        """Sum of cost_usd across ALL groups for a specific poll timestamp."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_records "
+            "WHERE poll_ts = ?",
+            (poll_ts,),
+        ).fetchone()
+        return row[0]
+
     # ------------------------------------------------------------------
     # Per-key costs
     # ------------------------------------------------------------------

@@ -27,6 +27,19 @@ USAGE_ENDPOINTS = {
     "vector_stores":             "usage/vector_stores",
 }
 
+# Supported group_by dimensions per endpoint type.
+# If a requested dimension isn't supported, it will be filtered out.
+SUPPORTED_GROUP_BY = {
+    "completions":               {"api_key_id", "model", "project_id", "user_id", "batch", "source"},
+    "embeddings":                {"api_key_id", "model", "project_id", "user_id", "batch"},
+    "images":                    {"api_key_id", "model", "project_id", "user_id", "size", "source"},
+    "audio_speeches":            {"api_key_id", "model", "project_id", "user_id"},
+    "audio_transcriptions":      {"api_key_id", "model", "project_id", "user_id"},
+    "moderations":               {"api_key_id", "model", "project_id", "user_id"},
+    "code_interpreter_sessions": {"project_id"},
+    "vector_stores":             {"project_id"},
+}
+
 
 @dataclass
 class UsageBucket:
@@ -44,12 +57,133 @@ class UsageResponse:
     next_page: Optional[str] = None
 
 
+@dataclass
+class ApiKeyInfo:
+    """Metadata about an API key."""
+    id: str
+    name: str
+    owner_email: str = ""
+    owner_name: str = ""
+
+
 class UsageClient:
     """Thin client for the OpenAI Organization Usage & Costs API."""
 
     def __init__(self, admin_key: str, org_id: Optional[str] = None):
         self.admin_key = admin_key
         self.org_id = org_id
+        # Cache for API key metadata: key_id -> ApiKeyInfo
+        self._key_cache: dict[str, ApiKeyInfo] = {}
+        # Flag to track if we have permissions to list keys
+        self._can_list_keys: Optional[bool] = None
+
+    # ------------------------------------------------------------------
+    # API Keys (for default group resolution)
+    # ------------------------------------------------------------------
+
+    def list_api_keys(self) -> list[str]:
+        """Fetch all API key IDs in the organization.
+
+        Returns a list of API key IDs (e.g., ["key_abc...", "key_def..."]).
+        Also populates the key metadata cache.
+
+        This requires the api.management.read scope. It works by:
+        1. Listing all projects in the organization
+        2. For each project, listing all API keys
+        """
+        all_keys: list[str] = []
+
+        # First, get all projects
+        projects = self._list_projects()
+
+        # For each project, get its API keys
+        for project_id in projects:
+            keys = self._list_project_api_keys(project_id)
+            all_keys.extend(keys)
+
+        return all_keys
+
+    def _list_projects(self) -> list[str]:
+        """List all project IDs in the organization."""
+        project_ids: list[str] = []
+        after: Optional[str] = None
+
+        while True:
+            params: dict[str, Any] = {"limit": 100}
+            if after:
+                params["after"] = after
+
+            raw = self._get("projects", params)
+            for proj in raw.get("data", []):
+                proj_id = proj.get("id", "")
+                if proj_id:
+                    project_ids.append(proj_id)
+
+            if raw.get("has_more"):
+                project_ids_list = raw.get("data", [])
+                if project_ids_list:
+                    after = project_ids_list[-1].get("id")
+                else:
+                    break
+            else:
+                break
+
+        return project_ids
+
+    def _list_project_api_keys(self, project_id: str) -> list[str]:
+        """List all API keys for a specific project."""
+        key_ids: list[str] = []
+        after: Optional[str] = None
+
+        while True:
+            params: dict[str, Any] = {"limit": 100}
+            if after:
+                params["after"] = after
+
+            try:
+                raw = self._get(f"projects/{project_id}/api_keys", params)
+            except RuntimeError:
+                # Project might not have any keys or we lack access
+                break
+
+            for key in raw.get("data", []):
+                key_id = key.get("id", "")
+                if key_id:
+                    key_ids.append(key_id)
+                    # Cache the key metadata
+                    # Project API keys have owner.user structure
+                    owner = key.get("owner", {})
+                    user = owner.get("user", {}) if owner.get("type") == "user" else {}
+                    self._key_cache[key_id] = ApiKeyInfo(
+                        id=key_id,
+                        name=key.get("name", ""),
+                        owner_email=user.get("email", ""),
+                        owner_name=user.get("name", ""),
+                    )
+
+            if raw.get("has_more"):
+                data = raw.get("data", [])
+                if data:
+                    after = data[-1].get("id")
+                else:
+                    break
+            else:
+                break
+
+        return key_ids
+
+    def get_key_info(self, key_id: str) -> ApiKeyInfo:
+        """Get metadata for a specific API key (uses cache if available)."""
+        if key_id in self._key_cache:
+            return self._key_cache[key_id]
+
+        # Key not in cache - return placeholder
+        # We can't easily look up a single key without knowing its project
+        return ApiKeyInfo(id=key_id, name="", owner_email="")
+
+    def get_all_cached_keys(self) -> dict[str, ApiKeyInfo]:
+        """Return the cached key metadata."""
+        return self._key_cache
 
     # ------------------------------------------------------------------
     # Low-level HTTP

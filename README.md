@@ -10,7 +10,10 @@ limits, and alert you before bills get out of control.
   restrict keys at the hard limit (150% of soft by default)
 - **Periodic polling** — runs every 10 minutes (configurable), stores costs in
   a local SQLite database, and checks rolling 1-hour / 24-hour windows
-- **Top spenders report** — after each poll, prints the 5 most expensive API keys
+- **Top spenders report** — after each poll, prints the top N most expensive API keys
+  with key name and owner email (configurable via `--show-top N`, default 5)
+- **Default key group** — use `default: true` to catch all API keys not explicitly
+  assigned to other groups
 - **YAML config** — one file defines key groups, limits, alerts, and SMTP settings
 - **CSV/JSON export** — download usage reports for offline analysis
 - **50+ model pricing** — built-in pricing for GPT-5.x, GPT-4.1, GPT-4o,
@@ -31,25 +34,53 @@ https://platform.openai.com/settings/organization/admin-keys
 git clone https://github.com/davidbartonau/openai-watchdog.git
 cd openai-watchdog
 uv sync
+```
 
-# Or install dependencies manually
-pip install openai>=1.0.0 pyyaml>=6.0
+Or with pip:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
 ```
 
 ## Quick start
 
-```bash
-# Set your admin key
-export OPENAI_ADMIN_KEY="sk-admin-..."
+### 1. Set up your API key
 
-# See what you've spent in the last 24 hours
+Create a `.env` file (already in `.gitignore`):
+
+```bash
+echo 'OPENAI_ADMIN_KEY=sk-admin-your-key-here' > .env
+```
+
+### 2. Run commands
+
+```bash
+# Load your key and run
+source .env && export OPENAI_ADMIN_KEY
+
+# With uv:
+uv run openai-watchdog usage
+
+# Or with pip install:
 openai-watchdog usage
+```
+
+### 3. Basic commands
+
+```bash
+# See what you've spent in the last 24 hours
+uv run openai-watchdog usage
 
 # See reconciled billing costs for the last 7 days
-openai-watchdog costs
+uv run openai-watchdog costs
 
 # Show built-in pricing table
-openai-watchdog prices
+uv run openai-watchdog prices
+
+# Run a single poll cycle
+uv run openai-watchdog poll --once
 ```
 
 ## Configuration
@@ -64,6 +95,7 @@ cp watchdog.example.yaml watchdog.yaml
 
 ```yaml
 admin_key_env: OPENAI_ADMIN_KEY
+has_org_admin: false   # Set to true if your key has api.management.read scope
 
 poll:
   interval_seconds: 600    # 10 minutes
@@ -88,6 +120,14 @@ key_groups:
       hourly: 10.0
       daily: 50.0
 
+  # Default group catches all keys not listed in other groups
+  other-keys:
+    default: true
+    owner_email: admin@example.com
+    limits:
+      hourly: 100.0
+      daily: 500.0
+
 alerts:
   stdout: true
   # webhook_url: https://hooks.slack.com/services/...
@@ -111,9 +151,11 @@ export:
 | Field | Description | Default |
 |---|---|---|
 | `admin_key_env` | Env var containing the Admin API key | `OPENAI_ADMIN_KEY` |
+| `has_org_admin` | If true, key can list API keys and show key names/owners | `false` |
 | `poll.interval_seconds` | Seconds between poll cycles | `600` (10 min) |
 | `poll.db_path` | Path to the SQLite database | `watchdog.db` |
-| `key_groups.<name>.api_key_ids` | List of API key IDs in this group | (required) |
+| `key_groups.<name>.api_key_ids` | List of API key IDs in this group | (required unless default) |
+| `key_groups.<name>.default` | If true, catches all keys not in other groups | `false` |
 | `key_groups.<name>.owner_email` | Email for soft-limit notifications | (optional) |
 | `key_groups.<name>.limits.hourly` | Soft hourly spend limit in USD | (optional) |
 | `key_groups.<name>.limits.daily` | Soft daily spend limit in USD | (optional) |
@@ -196,6 +238,23 @@ For each key group, limits are checked against rolling windows:
 **Example:** `hourly: 20.0, daily: 30.0`
 - Soft limits: $20/hour, $30/day
 - Hard limits: $30/hour (150%), $45/day (150%)
+
+## Organization admin permissions
+
+Some features require your Admin API key to have the `api.management.read` scope.
+Set `has_org_admin: true` in your config to enable these features:
+
+| Feature | Requires `has_org_admin` |
+|---|---|
+| Show key names and owner emails in top-N report | Yes |
+| Use `default: true` to catch all unassigned keys | Yes |
+| Disable/restrict keys when hard limits are hit | Yes |
+| Basic usage monitoring and alerts | No |
+
+To create an Admin API key with management permissions:
+1. Go to https://platform.openai.com/settings/organization/admin-keys
+2. Create a new key with the `api.management.read` scope (and `api.management.write`
+   if you want automatic key restriction on hard limit breach)
 
 ## Email alerts
 
@@ -301,7 +360,7 @@ All commands accept:
 ### `openai-watchdog poll`
 
 ```
-openai-watchdog poll [--once] [--interval N] [--db PATH] [--config PATH]
+openai-watchdog poll [--once] [--interval N] [--db PATH] [--show-top N] [--config PATH]
 ```
 
 | Flag | Description | Default |
@@ -309,6 +368,7 @@ openai-watchdog poll [--once] [--interval N] [--db PATH] [--config PATH]
 | `--once` | Run a single poll cycle and exit (for cron) | continuous |
 | `--interval N` | Poll interval in seconds | from config or 600 |
 | `--db PATH` | SQLite database path | from config or `watchdog.db` |
+| `--show-top N` | Show top N keys by cost (0 to disable) | `5` |
 
 ### `openai-watchdog status`
 
@@ -322,7 +382,7 @@ Shows rolling 1h and 24h costs per group, with limit status.
 
 ```
 openai-watchdog usage [--since TIME] [--until TIME] [--group-by DIMS]
-                      [--types TYPES] [--bucket-width 1m|1h|1d]
+                      [--types TYPES] [--bucket-width 1m|1h|1d] [--show-top N]
 ```
 
 | Flag | Description | Default |
@@ -332,6 +392,7 @@ openai-watchdog usage [--since TIME] [--until TIME] [--group-by DIMS]
 | `--group-by` | Comma-separated dimensions | `api_key_id,model` |
 | `--types` | Bucket types to fetch | all |
 | `--bucket-width` | Time granularity | `1d` |
+| `--show-top N` | Show top N keys by cost (0 to disable) | `5` |
 
 ### `openai-watchdog costs`
 
@@ -366,14 +427,21 @@ Exports raw usage data to a timestamped file.
 [poll] window: 2026-02-07 14:20 UTC -> 2026-02-07 14:30 UTC  (10 min)
 [poll] team-alpha: $2.340000 in this interval
 [poll] team-beta: $0.850000 in this interval
+[poll] ── Usage Summary ────────────────────────────────────────
+[poll]   This interval: $3.1900
+[poll]   Last hour:     $11.3500
+[poll]   Last 24h:      $37.0100
+[poll] ──────────────────────────────────────────────────────────
 [poll] team-alpha:  1h=$8.2300/$20.00  24h=$24.5600/$30.00  [OK]
 [poll] team-beta:   1h=$3.1200/$10.00  24h=$12.4500/$50.00  [OK]
 [poll] Top 5 keys by cost (24h):
-  1. sk-proj-abc1...f456  $12.3400  (team-alpha)
-  2. sk-proj-def4...g789  $8.2200   (team-alpha)
-  3. sk-proj-ghi7...h012  $6.1500   (team-beta)
-  4. sk-proj-jkl0...i345  $4.0000   (team-alpha)
-  5. sk-proj-mno3...j678  $2.8000   (team-beta)
+[poll]   #   Key ID                    Name                   Owner                        Cost
+[poll]   --- ------------------------- ---------------------- ---------------------------- ----------
+[poll]   1   sk-proj-abc1...23f456     Production API         alice@example.com            $   12.3400
+[poll]   2   sk-proj-def4...89g789     Staging API            alice@example.com            $    8.2200
+[poll]   3   sk-proj-ghi7...12h012     Development            bob@example.com              $    6.1500
+[poll]   4   sk-proj-jkl0...45i345     Testing                alice@example.com            $    4.0000
+[poll]   5   sk-proj-mno3...78j678     CI Pipeline            bob@example.com              $    2.8000
 [poll] All 2 group(s) within limits
 ```
 

@@ -37,6 +37,8 @@ def run_poll_cycle(
     db: WatchdogDB,
     *,
     verbose: bool = False,
+    show_top: int = 5,
+    has_org_admin: bool = False,
 ) -> list[dict]:
     """Execute one poll cycle.  Returns a list of limit-check results.
 
@@ -108,6 +110,17 @@ def run_poll_cycle(
 
     db.record_poll_end(poll_start)
 
+    # Print usage summary
+    if verbose:
+        interval_total = db.interval_cost(now)
+        hourly_total = db.total_rolling_cost(3600)
+        daily_total = db.total_rolling_cost(86400)
+        print(f"[poll] ── Usage Summary {'─' * 48}")
+        print(f"[poll]   This interval: ${interval_total:.4f}")
+        print(f"[poll]   Last hour:     ${hourly_total:.4f}")
+        print(f"[poll]   Last 24h:      ${daily_total:.4f}")
+        print(f"[poll] {'─' * 70}")
+
     # Now evaluate rolling limits from the DB.
     results = []
     for group in cfg.key_groups.values():
@@ -128,9 +141,9 @@ def run_poll_cycle(
         if verbose:
             _print_result(result, group, skip_hourly=first_run)
 
-    # Print top 5 most expensive keys (last 24h).
-    if verbose:
-        _print_top_keys(db)
+    # Print top N most expensive keys (last 24h).
+    if verbose and show_top > 0:
+        _print_top_keys(db, client, show_top, has_org_admin)
 
     # Run enforcement (emails, key restriction).
     enforce_limits(results, cfg, db, client, verbose=verbose)
@@ -200,16 +213,33 @@ def _print_result(result: dict, group: KeyGroup, *, skip_hourly: bool = False) -
     )
 
 
-def _print_top_keys(db: WatchdogDB) -> None:
-    """Print the 5 most expensive API keys in the last 24 hours."""
-    top = db.top_keys_by_cost(window_seconds=86400, limit=5)
+def _print_top_keys(db: WatchdogDB, client: UsageClient, limit: int = 5, has_org_admin: bool = False) -> None:
+    """Print the N most expensive API keys in the last 24 hours."""
+    top = db.top_keys_by_cost(window_seconds=86400, limit=limit)
     if not top:
         return
-    print("[poll] Top 5 keys by cost (24h):")
+    print(f"[poll] Top {limit} keys by cost (24h):")
+
+    if has_org_admin:
+        print(f"[poll]   {'#':<3s} {'Key ID':<25s} {'Name':<22s} {'Owner':<28s} {'Cost':>10s}")
+        print(f"[poll]   {'-'*3} {'-'*25} {'-'*22} {'-'*28} {'-'*10}")
+    else:
+        print(f"[poll]   {'#':<3s} {'Key ID':<25s} {'Cost':>10s}")
+        print(f"[poll]   {'-'*3} {'-'*25} {'-'*10}")
+
     for i, (key_id, group_name, cost) in enumerate(top, 1):
         # Truncate key ID for display (show first 12 + last 4 chars).
-        if len(key_id) > 20:
-            display_key = key_id[:12] + "..." + key_id[-4:]
+        if len(key_id) > 23:
+            display_key = key_id[:12] + "..." + key_id[-6:]
         else:
             display_key = key_id
-        print(f"  {i}. {display_key:<25s}  ${cost:.4f}  ({group_name})")
+
+        if has_org_admin:
+            # Get key metadata from cache or API
+            info = client.get_key_info(key_id)
+            name = info.name[:20] + ".." if len(info.name) > 22 else info.name
+            owner = info.owner_email or info.owner_name or "-"
+            owner = owner[:26] + ".." if len(owner) > 28 else owner
+            print(f"[poll]   {i:<3d} {display_key:<25s} {name:<22s} {owner:<28s} ${cost:>9.4f}")
+        else:
+            print(f"[poll]   {i:<3d} {display_key:<25s} ${cost:>9.4f}")

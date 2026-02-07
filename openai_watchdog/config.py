@@ -90,6 +90,7 @@ class KeyGroup:
     api_key_ids: list[str] = field(default_factory=list)
     owner_email: Optional[str] = None
     limits: SpendLimits = field(default_factory=SpendLimits)
+    default: bool = False  # If True, catches all keys not in other groups
 
     # Back-compat alias
     @property
@@ -146,6 +147,7 @@ class WatchdogConfig:
     """Top-level configuration."""
 
     admin_key_env: str = "OPENAI_ADMIN_KEY"
+    has_org_admin: bool = False  # If True, key can list/disable API keys
     poll: PollSettings = field(default_factory=PollSettings)
     key_groups: dict[str, KeyGroup] = field(default_factory=dict)
     alerts: AlertSettings = field(default_factory=AlertSettings)
@@ -154,6 +156,25 @@ class WatchdogConfig:
     def get_admin_key(self) -> Optional[str]:
         """Resolve the admin key from the configured environment variable."""
         return os.environ.get(self.admin_key_env)
+
+
+def resolve_default_groups(cfg: WatchdogConfig, all_key_ids: list[str]) -> None:
+    """Populate api_key_ids for groups marked as default.
+
+    For each group with ``default=True``, sets its ``api_key_ids`` to all keys
+    in *all_key_ids* that are not explicitly listed in any other group.
+    """
+    # Collect all explicitly-assigned key IDs
+    explicit_keys: set[str] = set()
+    for group in cfg.key_groups.values():
+        if not group.default:
+            explicit_keys.update(group.api_key_ids)
+
+    # Assign remaining keys to default groups
+    remaining_keys = [k for k in all_key_ids if k not in explicit_keys]
+    for group in cfg.key_groups.values():
+        if group.default:
+            group.api_key_ids = remaining_keys
 
 
 def load_config(path: Optional[str] = None) -> WatchdogConfig:
@@ -184,6 +205,7 @@ def _parse_config(raw: dict[str, Any]) -> WatchdogConfig:
     cfg = WatchdogConfig()
 
     cfg.admin_key_env = raw.get("admin_key_env", cfg.admin_key_env)
+    cfg.has_org_admin = raw.get("has_org_admin", False)
 
     # Poll settings
     poll_raw = raw.get("poll", {})
@@ -217,6 +239,7 @@ def _parse_config(raw: dict[str, Any]) -> WatchdogConfig:
             api_key_ids=group_raw.get("api_key_ids", []),
             owner_email=group_raw.get("owner_email"),
             limits=limits,
+            default=group_raw.get("default", False),
         )
 
     # Alerts

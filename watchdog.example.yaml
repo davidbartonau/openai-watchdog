@@ -4,6 +4,11 @@
 # Environment variable containing the OpenAI Admin API key.
 admin_key_env: OPENAI_ADMIN_KEY
 
+# Set to true if your admin key has the api.management.read scope.
+# This enables: listing all API keys, showing key names/owners in reports,
+# using 'default: true' groups, and disabling keys when hard limits are hit.
+# has_org_admin: false
+
 # Poller settings (used by `openai-watchdog poll`).
 poll:
   interval_seconds: 600    # 10 minutes
@@ -12,8 +17,12 @@ poll:
 # Key groups: name each group and list API key IDs that belong to it.
 # Set hourly/daily spend limits.  Hard limit = soft * hard_multiplier.
 #
-# Soft limit  → email the owner with a warning.
-# Hard limit  → restrict the key to read-only via OpenAI Admin API.
+# Soft limit  -> email the owner with a warning.
+# Hard limit  -> restrict the key to read-only via OpenAI Admin API.
+#
+# Use "default: true" to create a catch-all group for keys not listed in
+# any other group.  The watchdog will query all API keys and assign any
+# unassigned ones to this group.
 key_groups:
   team-alpha:
     api_key_ids:
@@ -33,6 +42,14 @@ key_groups:
       hourly: 10.0
       daily: 50.0
       # hard_multiplier defaults to 1.5
+
+  # Default group: catches all keys not listed in other groups
+  # default-group:
+  #   default: true
+  #   owner_email: admin@example.com
+  #   limits:
+  #     hourly: 100.0
+  #     daily: 500.0
 
 # Alert settings (triggered by soft/hard limit breaches).
 alerts:

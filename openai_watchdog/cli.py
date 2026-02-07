@@ -7,14 +7,14 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from openai_watchdog.config import load_config
+from openai_watchdog.config import load_config, resolve_default_groups
 from openai_watchdog.pricing import (
     TEXT_PRICING,
     EMBEDDING_PRICING,
     estimate_text_cost,
     estimate_embedding_cost,
 )
-from openai_watchdog.usage import UsageClient, USAGE_ENDPOINTS, days_ago, hours_ago
+from openai_watchdog.usage import UsageClient, USAGE_ENDPOINTS, SUPPORTED_GROUP_BY, days_ago, hours_ago
 
 
 def _get_admin_key(config_path=None) -> str:
@@ -42,7 +42,18 @@ def _ts_label(ts: int) -> str:
 
 def cmd_usage(args: argparse.Namespace) -> None:
     """Fetch and display usage across all bucket types."""
+    from openai_watchdog.pricing import estimate_text_cost, estimate_embedding_cost
+
+    cfg = load_config(getattr(args, "config", None))
     client = UsageClient(_get_admin_key(getattr(args, "config", None)))
+
+    # Pre-fetch all API keys to populate the cache for top N display
+    # Only if we have org admin permissions
+    if cfg.has_org_admin:
+        try:
+            client.list_api_keys()
+        except RuntimeError:
+            pass  # Continue without cache if it fails
 
     start = _parse_time_arg(args.since)
     end = _parse_time_arg(args.until) if args.until else None
@@ -56,15 +67,25 @@ def cmd_usage(args: argparse.Namespace) -> None:
     print(f"Bucket width: {args.bucket_width}")
     print()
 
+    # Track totals for summary
+    total_cost = 0.0
+    total_requests = 0
+    key_costs: dict[str, float] = {}  # key_id -> total cost
+
     for btype in bucket_types:
         if btype not in USAGE_ENDPOINTS:
             print(f"  [skip] Unknown type: {btype}")
             continue
+
+        # Filter group_by to only supported dimensions for this endpoint
+        supported = SUPPORTED_GROUP_BY.get(btype, set())
+        filtered_group_by = [g for g in group_by if g in supported]
+
         try:
             resp = client.get_usage(
                 btype, start, end,
                 bucket_width=args.bucket_width,
-                group_by=group_by,
+                group_by=filtered_group_by if filtered_group_by else None,
             )
         except RuntimeError as exc:
             print(f"  [{btype}] ERROR: {exc}")
@@ -80,8 +101,63 @@ def cmd_usage(args: argparse.Namespace) -> None:
                 continue
             print(f"  {_ts_label(bucket.start_time)} → {_ts_label(bucket.end_time)}")
             for r in bucket.results:
-                _print_result_row(btype, r, group_by)
+                _print_result_row(btype, r, filtered_group_by or group_by)
+
+                # Accumulate for summary
+                reqs = r.get("num_model_requests", 0) or 0
+                total_requests += reqs
+                key_id = r.get("api_key_id", "")
+                model = r.get("model", "")
+
+                cost = None
+                if btype == "completions":
+                    inp = r.get("input_tokens", 0) or 0
+                    out = r.get("output_tokens", 0) or 0
+                    cached = r.get("input_cached_tokens", 0) or 0
+                    cost = estimate_text_cost(model, inp, out, cached)
+                elif btype == "embeddings":
+                    inp = r.get("input_tokens", 0) or 0
+                    cost = estimate_embedding_cost(model, inp)
+
+                if cost is not None:
+                    total_cost += cost
+                    if key_id:
+                        key_costs[key_id] = key_costs.get(key_id, 0.0) + cost
         print()
+
+    # Print summary
+    print("=" * 70)
+    print(f"SUMMARY: {total_requests:,} requests, estimated ${total_cost:.4f}")
+    print("=" * 70)
+
+    # Print top N keys
+    show_top = getattr(args, "show_top", 5)
+    if key_costs and show_top > 0:
+        print()
+        print(f"Top {show_top} API keys by cost:")
+        if cfg.has_org_admin:
+            print(f"  {'Key ID':<28s} {'Name':<25s} {'Owner':<30s} {'Cost':>10s}")
+            print(f"  {'-'*28} {'-'*25} {'-'*30} {'-'*10}")
+        else:
+            print(f"  {'Key ID':<28s} {'Cost':>10s}")
+            print(f"  {'-'*28} {'-'*10}")
+
+        sorted_keys = sorted(key_costs.items(), key=lambda x: x[1], reverse=True)[:show_top]
+        for key_id, cost in sorted_keys:
+            # Truncate key ID for display
+            if len(key_id) > 26:
+                display_key = key_id[:12] + "..." + key_id[-8:]
+            else:
+                display_key = key_id
+
+            if cfg.has_org_admin:
+                info = client.get_key_info(key_id)
+                name = info.name[:23] + ".." if len(info.name) > 25 else info.name
+                owner = info.owner_email or info.owner_name or "-"
+                owner = owner[:28] + ".." if len(owner) > 30 else owner
+                print(f"  {display_key:<28s} {name:<25s} {owner:<30s} ${cost:>9.4f}")
+            else:
+                print(f"  {display_key:<28s} ${cost:>9.4f}")
 
 
 def cmd_costs(args: argparse.Namespace) -> None:
@@ -145,6 +221,21 @@ def cmd_groups(args: argparse.Namespace) -> None:
         return
 
     client = UsageClient(_get_admin_key(getattr(args, "config", None)))
+
+    # Resolve default groups (requires has_org_admin)
+    has_default = any(g.default for g in cfg.key_groups.values())
+    if has_default:
+        if not cfg.has_org_admin:
+            print("Warning: 'default: true' groups require has_org_admin: true in config",
+                  file=sys.stderr)
+        else:
+            try:
+                all_keys = client.list_api_keys()
+                resolve_default_groups(cfg, all_keys)
+            except Exception as exc:
+                print(f"Warning: Could not resolve default groups: {exc}",
+                      file=sys.stderr)
+
     start = _parse_time_arg(args.since)
     end = _parse_time_arg(args.until) if args.until else None
 
@@ -196,13 +287,27 @@ def cmd_watch(args: argparse.Namespace) -> None:
         print("No key groups configured. Add key_groups to watchdog.yaml.")
         return
 
+    client = UsageClient(_get_admin_key(getattr(args, "config", None)))
+
+    # Resolve default groups (requires has_org_admin)
+    has_default = any(g.default for g in cfg.key_groups.values())
+    if has_default:
+        if not cfg.has_org_admin:
+            print("Warning: 'default: true' groups require has_org_admin: true in config",
+                  file=sys.stderr)
+        else:
+            try:
+                all_keys = client.list_api_keys()
+                resolve_default_groups(cfg, all_keys)
+            except Exception as exc:
+                print(f"Warning: Could not resolve default groups: {exc}",
+                      file=sys.stderr)
+
     groups_with_limits = [g for g in cfg.key_groups.values()
                           if g.limits.has_any_limit]
     if not groups_with_limits:
         print("No rate limits configured. Set limits on key groups.")
         return
-
-    client = UsageClient(_get_admin_key(getattr(args, "config", None)))
 
     print(f"Checking rate limits for {len(groups_with_limits)} group(s)...")
     checks = check_rate_limits(client, cfg)
@@ -243,13 +348,36 @@ def cmd_poll(args: argparse.Namespace) -> None:
         return
 
     client = UsageClient(_get_admin_key(getattr(args, "config", None)))
+
+    # Resolve default groups (fetch all keys and assign unassigned ones)
+    # Only possible if we have org admin permissions
+    has_default = any(g.default for g in cfg.key_groups.values())
+    if has_default:
+        if not cfg.has_org_admin:
+            print("[poll] Warning: 'default: true' groups require has_org_admin: true in config",
+                  file=sys.stderr)
+        else:
+            try:
+                all_keys = client.list_api_keys()
+                resolve_default_groups(cfg, all_keys)
+                default_groups = [g.name for g in cfg.key_groups.values() if g.default]
+                for gname in default_groups:
+                    grp = cfg.key_groups[gname]
+                    print(f"[poll] Resolved default group '{gname}' with {len(grp.api_key_ids)} key(s)")
+            except Exception as exc:
+                print(f"[poll] Warning: Could not resolve default groups: {exc}",
+                      file=sys.stderr)
+
     db = WatchdogDB(args.db or cfg.poll.db_path)
     db.connect()
     interval = args.interval or cfg.poll.interval_seconds
 
+    show_top = getattr(args, "show_top", 5)
+
     if args.once:
         print(f"[poll] Running single poll cycle...")
-        results = run_poll_cycle(cfg, client, db, verbose=True)
+        results = run_poll_cycle(cfg, client, db, verbose=True, show_top=show_top,
+                                  has_org_admin=cfg.has_org_admin)
         _print_poll_summary(results)
         db.close()
         # Exit non-zero if any hard limits exceeded.
@@ -278,7 +406,8 @@ def cmd_poll(args: argparse.Namespace) -> None:
 
     while running:
         try:
-            results = run_poll_cycle(cfg, client, db, verbose=True)
+            results = run_poll_cycle(cfg, client, db, verbose=True, show_top=show_top,
+                                      has_org_admin=cfg.has_org_admin)
             _print_poll_summary(results)
         except Exception as exc:
             print(f"[poll] ERROR in poll cycle: {exc}", file=sys.stderr)
@@ -490,6 +619,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--bucket-width", default="1d", choices=["1m", "1h", "1d"],
         help="Time bucket granularity (default: 1d)",
     )
+    p_usage.add_argument(
+        "--show-top", type=int, default=5,
+        help="Show top N keys by cost (default: 5, 0 to disable)",
+    )
 
     # --- costs ---
     p_costs = sub.add_parser("costs", help="Show reconciled cost data")
@@ -547,6 +680,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_poll.add_argument(
         "--db", default=None,
         help="Path to SQLite database (default: from config or watchdog.db)",
+    )
+    p_poll.add_argument(
+        "--show-top", type=int, default=5,
+        help="Show top N keys by cost (default: 5, 0 to disable)",
     )
 
     # --- status (query rolling costs from DB) ---

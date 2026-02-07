@@ -39,6 +39,9 @@ Example config::
         from_addr: watchdog@example.com
         username: watchdog@example.com
         password_env: SMTP_PASSWORD
+        cc_addrs:
+          - manager@example.com
+          - billing@example.com
 
     export:
       format: csv
@@ -103,6 +106,7 @@ class EmailSettings:
     from_addr: str = ""
     username: str = ""
     password_env: str = "SMTP_PASSWORD"
+    cc_addrs: list[str] = field(default_factory=list)
 
     @property
     def configured(self) -> bool:
@@ -221,12 +225,16 @@ def _parse_config(raw: dict[str, Any]) -> WatchdogConfig:
         email = EmailSettings()
         email_raw = alerts_raw.get("email", {})
         if isinstance(email_raw, dict):
+            cc_raw = email_raw.get("cc_addrs", [])
+            if isinstance(cc_raw, str):
+                cc_raw = [cc_raw]
             email = EmailSettings(
                 smtp_host=email_raw.get("smtp_host", ""),
                 smtp_port=email_raw.get("smtp_port", 587),
                 from_addr=email_raw.get("from_addr", ""),
                 username=email_raw.get("username", ""),
                 password_env=email_raw.get("password_env", "SMTP_PASSWORD"),
+                cc_addrs=cc_raw,
             )
         cfg.alerts = AlertSettings(
             stdout=alerts_raw.get("stdout", True),

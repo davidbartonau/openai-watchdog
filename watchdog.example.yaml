@@ -46,6 +46,9 @@ alerts:
   #   from_addr: watchdog@example.com
   #   username: watchdog@example.com
   #   password_env: SMTP_PASSWORD    # reads password from this env var
+  #   cc_addrs:                      # optional: CC these addresses on every alert
+  #     - manager@example.com
+  #     - billing@example.com
 
 # Export settings (used by `openai-watchdog export` and --export flags).
 export:

@@ -287,6 +287,8 @@ def _send_email(
     msg["Subject"] = subject
     msg["From"] = settings.from_addr
     msg["To"] = to_addr
+    if settings.cc_addrs:
+        msg["Cc"] = ", ".join(settings.cc_addrs)
     msg.set_content(body)
 
     password = settings.get_password()
@@ -299,7 +301,8 @@ def _send_email(
                 smtp.login(settings.username, password)
             smtp.send_message(msg)
         if verbose:
-            print(f"[enforce] Email sent to {to_addr}: {subject}")
+            cc_str = f" (cc: {', '.join(settings.cc_addrs)})" if settings.cc_addrs else ""
+            print(f"[enforce] Email sent to {to_addr}{cc_str}: {subject}")
         return True
     except Exception as exc:
         print(f"[enforce] Email to {to_addr} failed: {exc}", file=sys.stderr)

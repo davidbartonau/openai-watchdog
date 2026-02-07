@@ -97,6 +97,9 @@ alerts:
     from_addr: watchdog@example.com
     username: watchdog@example.com
     password_env: SMTP_PASSWORD    # reads password from this env var
+    cc_addrs:                      # CC these addresses on every alert
+      - manager@example.com
+      - billing@example.com
 
 export:
   format: csv
@@ -122,6 +125,7 @@ export:
 | `alerts.email.from_addr` | From address for alert emails | (optional) |
 | `alerts.email.username` | SMTP login username | (optional) |
 | `alerts.email.password_env` | Env var containing SMTP password | `SMTP_PASSWORD` |
+| `alerts.email.cc_addrs` | List of CC addresses for all alert emails | `[]` |
 | `export.format` | Export format: `csv` or `json` | `csv` |
 | `export.output_dir` | Directory for exported reports | `./reports` |
 
@@ -207,6 +211,9 @@ alerts:
     from_addr: watchdog@example.com # the "From" address on alert emails
     username: watchdog@example.com  # SMTP login username
     password_env: SMTP_PASSWORD     # env var containing the SMTP password
+    cc_addrs:                       # CC these addresses on every alert
+      - manager@example.com
+      - billing@example.com
 ```
 
 Then set the password in your environment:

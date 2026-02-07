@@ -1,8 +1,7 @@
 """Enforcement actions for limit breaches.
 
 Soft limit  → email the key owner + stdout/webhook alert.
-Hard limit  → restrict the API key via OpenAI Admin API (demote to read-only)
-              + email + alert.
+Hard limit  → DELETE the API key via OpenAI Admin API + email + alert.
 """
 
 import json
@@ -10,6 +9,7 @@ import smtplib
 import sys
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from email.message import EmailMessage
 from typing import Optional
 
@@ -19,6 +19,19 @@ from openai_watchdog.db import WatchdogDB
 
 # The OpenAI Admin API key management endpoint.
 ADMIN_API_KEYS_URL = "https://api.openai.com/v1/organization/api_keys"
+
+
+@dataclass
+class KeyAlert:
+    """Details about a key that exceeded a limit."""
+    key_id: str
+    key_name: str
+    owner: str
+    group_name: str
+    alert_type: str  # soft_hourly, soft_daily, hard_hourly, hard_daily
+    cost: float
+    limit: float
+    hard_limit: float  # For soft alerts, shows when key will be deleted
 
 
 def enforce_limits(
@@ -31,9 +44,16 @@ def enforce_limits(
 ) -> None:
     """Walk through limit-check results and take appropriate actions.
 
-    Results are now per-key, not per-group. Each key that exceeds limits
-    is handled individually.
+    Results are per-key. This function:
+    1. Collects all over-limit keys
+    2. Performs enforcement actions (delete for hard limits)
+    3. Sends batched emails with all over-limit keys listed
+    4. Posts webhooks for each key individually
     """
+    # Collect all alerts, grouped by owner email for batched emails
+    soft_alerts: list[KeyAlert] = []
+    hard_alerts: list[KeyAlert] = []
+
     for result in results:
         key_id = result.get("key_id")
         if not key_id:
@@ -44,208 +64,253 @@ def enforce_limits(
         if group is None:
             continue
 
-        # Get key metadata for emails/alerts
+        # Get key metadata
         key_info = client.get_key_info(key_id)
+        key_name = key_info.name or key_id
+        owner = key_info.owner_email or key_info.owner_name or "unknown"
 
         # --- Hard limits (checked first — more severe) ---
         if result.get("hard_hourly_exceeded"):
-            _handle_hard_key(
+            alert = KeyAlert(
                 key_id=key_id,
-                key_info=key_info,
+                key_name=key_name,
+                owner=owner,
                 group_name=group_name,
                 alert_type="hard_hourly",
                 cost=result["hourly_cost"],
                 limit=result["hard_hourly_limit"],
-                window="hourly",
-                group=group,
-                cfg=cfg,
-                db=db,
-                admin_key=client.admin_key,
-                verbose=verbose,
+                hard_limit=result["hard_hourly_limit"],
             )
+            hard_alerts.append(alert)
 
         if result.get("hard_daily_exceeded"):
-            _handle_hard_key(
+            alert = KeyAlert(
                 key_id=key_id,
-                key_info=key_info,
+                key_name=key_name,
+                owner=owner,
                 group_name=group_name,
                 alert_type="hard_daily",
                 cost=result["daily_cost"],
                 limit=result["hard_daily_limit"],
-                window="daily",
-                group=group,
-                cfg=cfg,
-                db=db,
-                admin_key=client.admin_key,
-                verbose=verbose,
+                hard_limit=result["hard_daily_limit"],
             )
+            hard_alerts.append(alert)
 
-        # --- Soft limits ---
+        # --- Soft limits (only if not already at hard limit) ---
         if result.get("soft_hourly_exceeded") and not result.get("hard_hourly_exceeded"):
-            _handle_soft_key(
+            alert = KeyAlert(
                 key_id=key_id,
-                key_info=key_info,
+                key_name=key_name,
+                owner=owner,
                 group_name=group_name,
                 alert_type="soft_hourly",
                 cost=result["hourly_cost"],
                 limit=result["hourly_limit"],
-                window="hourly",
-                group=group,
-                cfg=cfg,
-                db=db,
-                verbose=verbose,
+                hard_limit=result["hard_hourly_limit"],
             )
+            soft_alerts.append(alert)
 
         if result.get("soft_daily_exceeded") and not result.get("hard_daily_exceeded"):
-            _handle_soft_key(
+            alert = KeyAlert(
                 key_id=key_id,
-                key_info=key_info,
+                key_name=key_name,
+                owner=owner,
                 group_name=group_name,
                 alert_type="soft_daily",
                 cost=result["daily_cost"],
                 limit=result["daily_limit"],
-                window="daily",
-                group=group,
-                cfg=cfg,
-                db=db,
-                verbose=verbose,
+                hard_limit=result["hard_daily_limit"],
             )
+            soft_alerts.append(alert)
+
+    # Process hard alerts first (delete keys, send emails)
+    _process_hard_alerts(hard_alerts, cfg, db, client.admin_key, verbose)
+
+    # Process soft alerts (warnings only)
+    _process_soft_alerts(soft_alerts, cfg, db, verbose)
 
 
-def _handle_soft_key(
-    *,
-    key_id: str,
-    key_info,  # ApiKeyInfo
-    group_name: str,
-    alert_type: str,
-    cost: float,
-    limit: float,
-    window: str,
-    group,
-    cfg: WatchdogConfig,
-    db: WatchdogDB,
-    verbose: bool,
-) -> None:
-    """Soft limit for a single key: alert the owner but don't restrict access."""
-    # Use key_id for deduplication, not group_name
-    alert_key = f"{key_id}:{alert_type}"
-    if db.was_alert_sent_recently(alert_key, alert_type, cooldown_seconds=3600):
-        if verbose:
-            print(f"[enforce] {key_id}: {alert_type} alert already sent recently")
-        return
-
-    key_name = key_info.name or key_id
-    owner = key_info.owner_email or key_info.owner_name or "unknown"
-
-    msg = (
-        f"[openai-watchdog] SOFT LIMIT ({window}): "
-        f"key {key_name} ({key_id}) at ${cost:.4f} (limit ${limit:.2f})"
-    )
-
-    if cfg.alerts.stdout:
-        print(msg, file=sys.stderr)
-
-    if cfg.alerts.webhook_url:
-        _post_webhook_key(
-            cfg.alerts.webhook_url, alert_type, key_id, key_name, owner,
-            group_name, cost, limit
-        )
-
-    if group.owner_email and cfg.alerts.email.configured:
-        hard_limit = limit * cfg.key_groups[group_name].limits.hard_multiplier
-        _send_email(
-            settings=cfg.alerts.email,
-            to_addr=group.owner_email,
-            subject=f"OpenAI Watchdog: API key soft {window} limit exceeded",
-            body=(
-                f"An API key in group \"{group_name}\" has exceeded its "
-                f"{window} soft spend limit.\n\n"
-                f"  Key ID:         {key_id}\n"
-                f"  Key name:       {key_name}\n"
-                f"  Owner:          {owner}\n"
-                f"  Current spend:  ${cost:.4f}\n"
-                f"  Soft limit:     ${limit:.2f}\n"
-                f"  Hard limit:     ${hard_limit:.2f}\n\n"
-                f"WARNING: If spend reaches the hard limit, this key will be "
-                f"DELETED automatically.\n"
-            ),
-            verbose=verbose,
-        )
-
-    db.record_alert(alert_key, alert_type, cost, limit)
-
-
-def _handle_hard_key(
-    *,
-    key_id: str,
-    key_info,  # ApiKeyInfo
-    group_name: str,
-    alert_type: str,
-    cost: float,
-    limit: float,
-    window: str,
-    group,
+def _process_hard_alerts(
+    alerts: list[KeyAlert],
     cfg: WatchdogConfig,
     db: WatchdogDB,
     admin_key: str,
     verbose: bool,
 ) -> None:
-    """Hard limit for a single key: restrict just this key + alert."""
-    # Use key_id for deduplication, not group_name
-    alert_key = f"{key_id}:{alert_type}"
-    if db.was_alert_sent_recently(alert_key, alert_type, cooldown_seconds=3600):
-        if verbose:
-            print(f"[enforce] {key_id}: {alert_type} already enforced recently")
+    """Process hard limit alerts: delete keys and send batched email."""
+    if not alerts:
         return
 
-    key_name = key_info.name or key_id
-    owner = key_info.owner_email or key_info.owner_name or "unknown"
+    # Filter out alerts that were already sent recently
+    new_alerts = []
+    for alert in alerts:
+        alert_key = f"{alert.key_id}:{alert.alert_type}"
+        if db.was_alert_sent_recently(alert_key, alert.alert_type, cooldown_seconds=3600):
+            if verbose:
+                print(f"[enforce] {alert.key_id}: {alert.alert_type} already enforced recently")
+            continue
+        new_alerts.append(alert)
 
-    msg = (
-        f"[openai-watchdog] HARD LIMIT ({window}): "
-        f"key {key_name} ({key_id}) at ${cost:.4f} (hard limit ${limit:.2f}) — "
-        f"DELETING key"
-    )
+    if not new_alerts:
+        return
 
-    if cfg.alerts.stdout:
-        print(msg, file=sys.stderr)
-
-    # Delete this specific key
-    _restrict_api_key(admin_key, key_id, verbose=verbose)
-
-    if cfg.alerts.webhook_url:
-        _post_webhook_key(
-            cfg.alerts.webhook_url, alert_type, key_id, key_name, owner,
-            group_name, cost, limit
+    # Print to stdout and delete each key
+    for alert in new_alerts:
+        window = "hourly" if "hourly" in alert.alert_type else "daily"
+        msg = (
+            f"[openai-watchdog] HARD LIMIT ({window}): "
+            f"key {alert.key_name} ({alert.key_id}) at ${alert.cost:.4f} "
+            f"(hard limit ${alert.limit:.2f}) — DELETING key"
         )
+        if cfg.alerts.stdout:
+            print(msg, file=sys.stderr)
 
-    if group.owner_email and cfg.alerts.email.configured:
+        # Delete the key
+        _delete_api_key(admin_key, alert.key_id, verbose=verbose)
+
+        # Post webhook
+        if cfg.alerts.webhook_url:
+            _post_webhook_key(
+                cfg.alerts.webhook_url, alert.alert_type, alert.key_id,
+                alert.key_name, alert.owner, alert.group_name,
+                alert.cost, alert.limit
+            )
+
+        # Record alert
+        alert_key = f"{alert.key_id}:{alert.alert_type}"
+        db.record_alert(alert_key, alert.alert_type, alert.cost, alert.limit)
+
+    # Send batched email with all hard limit keys
+    if cfg.alerts.email.configured:
+        _send_batched_email(new_alerts, cfg, is_hard=True, verbose=verbose)
+
+
+def _process_soft_alerts(
+    alerts: list[KeyAlert],
+    cfg: WatchdogConfig,
+    db: WatchdogDB,
+    verbose: bool,
+) -> None:
+    """Process soft limit alerts: send warnings."""
+    if not alerts:
+        return
+
+    # Filter out alerts that were already sent recently
+    new_alerts = []
+    for alert in alerts:
+        alert_key = f"{alert.key_id}:{alert.alert_type}"
+        if db.was_alert_sent_recently(alert_key, alert.alert_type, cooldown_seconds=3600):
+            if verbose:
+                print(f"[enforce] {alert.key_id}: {alert.alert_type} alert already sent recently")
+            continue
+        new_alerts.append(alert)
+
+    if not new_alerts:
+        return
+
+    # Print to stdout for each key
+    for alert in new_alerts:
+        window = "hourly" if "hourly" in alert.alert_type else "daily"
+        msg = (
+            f"[openai-watchdog] SOFT LIMIT ({window}): "
+            f"key {alert.key_name} ({alert.key_id}) at ${alert.cost:.4f} "
+            f"(limit ${alert.limit:.2f})"
+        )
+        if cfg.alerts.stdout:
+            print(msg, file=sys.stderr)
+
+        # Post webhook
+        if cfg.alerts.webhook_url:
+            _post_webhook_key(
+                cfg.alerts.webhook_url, alert.alert_type, alert.key_id,
+                alert.key_name, alert.owner, alert.group_name,
+                alert.cost, alert.limit
+            )
+
+        # Record alert
+        alert_key = f"{alert.key_id}:{alert.alert_type}"
+        db.record_alert(alert_key, alert.alert_type, alert.cost, alert.limit)
+
+    # Send batched email with all soft limit keys
+    if cfg.alerts.email.configured:
+        _send_batched_email(new_alerts, cfg, is_hard=False, verbose=verbose)
+
+
+def _send_batched_email(
+    alerts: list[KeyAlert],
+    cfg: WatchdogConfig,
+    *,
+    is_hard: bool,
+    verbose: bool,
+) -> None:
+    """Send a single email listing all over-limit keys."""
+    if not alerts:
+        return
+
+    # Group alerts by owner_email (from the group config)
+    alerts_by_owner: dict[str, list[KeyAlert]] = {}
+    for alert in alerts:
+        group = cfg.key_groups.get(alert.group_name)
+        owner_email = group.owner_email if group else None
+        if owner_email:
+            alerts_by_owner.setdefault(owner_email, []).append(alert)
+
+    # Send one email per owner
+    for owner_email, owner_alerts in alerts_by_owner.items():
+        if is_hard:
+            subject = f"OpenAI Watchdog: {len(owner_alerts)} key(s) DELETED (hard limit)"
+            intro = (
+                f"{len(owner_alerts)} API key(s) have exceeded their HARD spend limits "
+                f"and have been DELETED.\n\n"
+            )
+            action = "\nAction taken: These keys have been DELETED.\n"
+            footer = "Contact your administrator to create new keys.\n"
+        else:
+            subject = f"OpenAI Watchdog: {len(owner_alerts)} key(s) over soft limit"
+            intro = (
+                f"{len(owner_alerts)} API key(s) have exceeded their soft spend limits.\n\n"
+            )
+            action = ""
+            footer = (
+                "\nWARNING: If any key reaches its hard limit, it will be "
+                "DELETED automatically.\n"
+            )
+
+        # Build the key details table
+        body = intro
+        body += "Keys over limit:\n"
+        body += "-" * 80 + "\n"
+        body += f"{'Key ID':<25s} {'Name':<20s} {'Type':<12s} {'Cost':>10s} {'Limit':>10s}\n"
+        body += "-" * 80 + "\n"
+
+        for alert in owner_alerts:
+            limit_type = alert.alert_type.replace("_", " ").title()
+            body += (
+                f"{alert.key_id:<25s} "
+                f"{alert.key_name[:18]:<20s} "
+                f"{limit_type:<12s} "
+                f"${alert.cost:>9.4f} "
+                f"${alert.limit:>9.2f}\n"
+            )
+
+        body += "-" * 80 + "\n"
+        body += action
+        body += footer
+
         _send_email(
             settings=cfg.alerts.email,
-            to_addr=group.owner_email,
-            subject=f"OpenAI Watchdog: API key HARD {window} limit — key DELETED",
-            body=(
-                f"An API key in group \"{group_name}\" has exceeded its "
-                f"{window} HARD spend limit.\n\n"
-                f"  Key ID:         {key_id}\n"
-                f"  Key name:       {key_name}\n"
-                f"  Owner:          {owner}\n"
-                f"  Current spend:  ${cost:.4f}\n"
-                f"  Hard limit:     ${limit:.2f}\n\n"
-                f"Action taken: this API key has been DELETED.\n\n"
-                f"Contact your administrator to create a new key.\n"
-            ),
+            to_addr=owner_email,
+            subject=subject,
+            body=body,
             verbose=verbose,
         )
-
-    db.record_alert(alert_key, alert_type, cost, limit)
 
 
 # ------------------------------------------------------------------
 # OpenAI Admin API: key deletion
 # ------------------------------------------------------------------
 
-def _restrict_api_key(admin_key: str, key_id: str, *, verbose: bool = False) -> bool:
+def _delete_api_key(admin_key: str, key_id: str, *, verbose: bool = False) -> bool:
     """Delete an API key when hard limit is breached.
 
     Uses DELETE /v1/organization/projects/{project_id}/api_keys/{key_id}

@@ -6,6 +6,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from openai_watchdog.config import load_config
 from openai_watchdog.pricing import (
     TEXT_PRICING,
     EMBEDDING_PRICING,
@@ -15,8 +16,12 @@ from openai_watchdog.pricing import (
 from openai_watchdog.usage import UsageClient, USAGE_ENDPOINTS, days_ago, hours_ago
 
 
-def _get_admin_key() -> str:
-    key = os.environ.get("OPENAI_ADMIN_KEY") or os.environ.get("OPENAI_API_KEY")
+def _get_admin_key(config_path=None) -> str:
+    """Resolve admin key: config → OPENAI_ADMIN_KEY → OPENAI_API_KEY."""
+    cfg = load_config(config_path)
+    key = cfg.get_admin_key()
+    if not key:
+        key = os.environ.get("OPENAI_ADMIN_KEY") or os.environ.get("OPENAI_API_KEY")
     if not key:
         print(
             "Error: Set OPENAI_ADMIN_KEY (preferred) or OPENAI_API_KEY.",
@@ -36,7 +41,7 @@ def _ts_label(ts: int) -> str:
 
 def cmd_usage(args: argparse.Namespace) -> None:
     """Fetch and display usage across all bucket types."""
-    client = UsageClient(_get_admin_key())
+    client = UsageClient(_get_admin_key(getattr(args, "config", None)))
 
     start = _parse_time_arg(args.since)
     end = _parse_time_arg(args.until) if args.until else None
@@ -80,7 +85,7 @@ def cmd_usage(args: argparse.Namespace) -> None:
 
 def cmd_costs(args: argparse.Namespace) -> None:
     """Fetch reconciled cost data."""
-    client = UsageClient(_get_admin_key())
+    client = UsageClient(_get_admin_key(getattr(args, "config", None)))
 
     start = _parse_time_arg(args.since)
     end = _parse_time_arg(args.until) if args.until else None
@@ -126,6 +131,126 @@ def cmd_prices(args: argparse.Namespace) -> None:
     print(f"  {'─'*40} {'─'*8}")
     for model, rate in sorted(EMBEDDING_PRICING.items()):
         print(f"  {model:<40s} ${rate:>7.3f}")
+
+
+def cmd_groups(args: argparse.Namespace) -> None:
+    """Show usage aggregated by configured key groups."""
+    from openai_watchdog.monitor import aggregate_group_usage
+    from openai_watchdog.export import export_group_summaries
+
+    cfg = load_config(getattr(args, "config", None))
+    if not cfg.key_groups:
+        print("No key groups configured. Add key_groups to watchdog.yaml.")
+        return
+
+    client = UsageClient(_get_admin_key(getattr(args, "config", None)))
+    start = _parse_time_arg(args.since)
+    end = _parse_time_arg(args.until) if args.until else None
+
+    print(f"Fetching group usage from {_ts_label(start)}"
+          f"{' to ' + _ts_label(end) if end else ' to now'}...")
+    print()
+
+    summaries = []
+    for name, group in cfg.key_groups.items():
+        summary = aggregate_group_usage(client, group, start, end)
+        summaries.append(summary)
+
+        print(f"── {name} ({'─' * (60 - len(name))})")
+        print(f"  API keys: {len(group.api_key_ids)}")
+        print(f"  Requests: {summary.total_requests:,}")
+        print(f"  Input tokens:  {summary.total_input_tokens:,}"
+              f"  (cached: {summary.total_cached_tokens:,})")
+        print(f"  Output tokens: {summary.total_output_tokens:,}")
+        print(f"  Estimated cost: ${summary.estimated_cost_usd:.4f}")
+        if summary.model_costs:
+            print("  By model:")
+            for model, cost in sorted(summary.model_costs.items(),
+                                      key=lambda x: x[1], reverse=True):
+                print(f"    {model:<40s} ${cost:.4f}")
+        if group.max_dollars_per_hour is not None:
+            print(f"  Rate limit: ${group.max_dollars_per_hour:.2f}/h")
+        print()
+
+    if args.export:
+        fmt = args.export_format or cfg.export.format
+        out_dir = args.export_dir or cfg.export.output_dir
+        path = export_group_summaries(summaries, fmt=fmt, output_dir=out_dir)
+        print(f"Exported to {path}")
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    """Check rate limits and fire alerts if thresholds are exceeded."""
+    from openai_watchdog.monitor import check_rate_limits, send_alerts
+    from openai_watchdog.export import export_rate_limit_checks
+
+    cfg = load_config(getattr(args, "config", None))
+    if not cfg.key_groups:
+        print("No key groups configured. Add key_groups to watchdog.yaml.")
+        return
+
+    groups_with_limits = [g for g in cfg.key_groups.values()
+                          if g.max_dollars_per_hour is not None]
+    if not groups_with_limits:
+        print("No rate limits configured. Set max_dollars_per_hour on key groups.")
+        return
+
+    client = UsageClient(_get_admin_key(getattr(args, "config", None)))
+
+    print(f"Checking rate limits for {len(groups_with_limits)} group(s)...")
+    checks = check_rate_limits(client, cfg)
+
+    for c in checks:
+        status = "EXCEEDED" if c.exceeded else "OK"
+        print(f"  {c.group_name:<30s} ${c.actual_dollars_last_hour:.4f}/h"
+              f"  limit=${c.max_dollars_per_hour:.2f}/h"
+              f"  ({c.pct_of_limit:.0f}%)  [{status}]")
+
+    breaches = [c for c in checks if c.exceeded]
+    if breaches:
+        print()
+        send_alerts(checks, cfg.alerts)
+
+    if args.export:
+        fmt = args.export_format or cfg.export.format
+        out_dir = args.export_dir or cfg.export.output_dir
+        path = export_rate_limit_checks(checks, fmt=fmt, output_dir=out_dir)
+        print(f"Exported to {path}")
+
+    # Exit with non-zero if any limits exceeded (useful for cron/CI)
+    if breaches:
+        sys.exit(1)
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    """Export raw usage data to CSV or JSON."""
+    from openai_watchdog.export import export_raw_usage
+
+    cfg = load_config(getattr(args, "config", None))
+    client = UsageClient(_get_admin_key(getattr(args, "config", None)))
+
+    start = _parse_time_arg(args.since)
+    end = _parse_time_arg(args.until) if args.until else None
+    bucket_types = args.types.split(",") if args.types else list(USAGE_ENDPOINTS)
+    fmt = args.format or cfg.export.format
+    out_dir = args.output_dir or cfg.export.output_dir
+
+    print(f"Fetching usage from {_ts_label(start)}"
+          f"{' to ' + _ts_label(end) if end else ' to now'}...")
+
+    usage_by_type = {}
+    for btype in bucket_types:
+        if btype not in USAGE_ENDPOINTS:
+            continue
+        try:
+            usage_by_type[btype] = client.get_usage(
+                btype, start, end, bucket_width="1h",
+            )
+        except RuntimeError as exc:
+            print(f"  [{btype}] ERROR: {exc}", file=sys.stderr)
+
+    path = export_raw_usage(usage_by_type, fmt=fmt, output_dir=out_dir)
+    print(f"Exported to {path}")
 
 
 # ------------------------------------------------------------------
@@ -191,6 +316,14 @@ def _print_result_row(btype: str, r: dict, group_by: list[str]) -> None:
 # Argument parser
 # ------------------------------------------------------------------
 
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add --config flag shared by all subcommands."""
+    parser.add_argument(
+        "--config", default=None,
+        help="Path to watchdog.yaml config file",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="openai-watchdog",
@@ -200,6 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- usage ---
     p_usage = sub.add_parser("usage", help="Show usage across API endpoints")
+    _add_common_args(p_usage)
     p_usage.add_argument(
         "--since", default="24h",
         help="Start time: e.g. '24h', '7d', unix timestamp, or ISO date (default: 24h)",
@@ -220,6 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- costs ---
     p_costs = sub.add_parser("costs", help="Show reconciled cost data")
+    _add_common_args(p_costs)
     p_costs.add_argument("--since", default="7d", help="Start time (default: 7d)")
     p_costs.add_argument("--until", default=None, help="End time")
     p_costs.add_argument(
@@ -228,7 +363,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # --- prices ---
-    sub.add_parser("prices", help="Display built-in pricing table")
+    p_prices = sub.add_parser("prices", help="Display built-in pricing table")
+    _add_common_args(p_prices)
+
+    # --- groups ---
+    p_groups = sub.add_parser("groups", help="Show usage by configured key groups")
+    _add_common_args(p_groups)
+    p_groups.add_argument("--since", default="24h", help="Start time (default: 24h)")
+    p_groups.add_argument("--until", default=None, help="End time")
+    p_groups.add_argument(
+        "--export", action="store_true",
+        help="Export results to file",
+    )
+    p_groups.add_argument("--export-format", choices=["csv", "json"], default=None)
+    p_groups.add_argument("--export-dir", default=None)
+
+    # --- watch ---
+    p_watch = sub.add_parser(
+        "watch",
+        help="Check rate limits and alert on breaches",
+    )
+    _add_common_args(p_watch)
+    p_watch.add_argument(
+        "--export", action="store_true",
+        help="Export check results to file",
+    )
+    p_watch.add_argument("--export-format", choices=["csv", "json"], default=None)
+    p_watch.add_argument("--export-dir", default=None)
+
+    # --- export ---
+    p_export = sub.add_parser("export", help="Export raw usage data to CSV/JSON")
+    _add_common_args(p_export)
+    p_export.add_argument("--since", default="24h", help="Start time (default: 24h)")
+    p_export.add_argument("--until", default=None, help="End time")
+    p_export.add_argument(
+        "--types", default=None,
+        help=f"Comma-separated bucket types (default: all). Options: {','.join(USAGE_ENDPOINTS)}",
+    )
+    p_export.add_argument(
+        "--format", choices=["csv", "json"], default=None,
+        help="Output format (default: from config or csv)",
+    )
+    p_export.add_argument(
+        "--output-dir", default=None,
+        help="Output directory (default: from config or ./reports)",
+    )
 
     return parser
 
@@ -245,6 +424,9 @@ def main() -> None:
         "usage": cmd_usage,
         "costs": cmd_costs,
         "prices": cmd_prices,
+        "groups": cmd_groups,
+        "watch": cmd_watch,
+        "export": cmd_export,
     }
     commands[args.command](args)
 

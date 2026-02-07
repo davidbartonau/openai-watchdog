@@ -1,0 +1,29 @@
+# openai-watchdog configuration
+# Copy this to watchdog.yaml and edit to match your setup.
+
+# Environment variable containing the OpenAI Admin API key.
+admin_key_env: OPENAI_ADMIN_KEY
+
+# Key groups: name each group and list API key IDs that belong to it.
+# Optionally set a max spend rate to trigger alerts.
+key_groups:
+  team-alpha:
+    api_key_ids:
+      - sk-proj-abc123...
+      - sk-proj-def456...
+    max_dollars_per_hour: 5.0
+
+  team-beta:
+    api_key_ids:
+      - sk-proj-ghi789...
+    max_dollars_per_hour: 10.0
+
+# Alert settings (triggered by `openai-watchdog watch`).
+alerts:
+  stdout: true
+  # webhook_url: https://hooks.slack.com/services/...
+
+# Export settings (used by `openai-watchdog export` and --export flags).
+export:
+  format: csv        # csv or json
+  output_dir: ./reports

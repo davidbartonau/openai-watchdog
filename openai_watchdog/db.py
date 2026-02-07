@@ -104,6 +104,17 @@ class WatchdogDB:
             CREATE INDEX IF NOT EXISTS idx_email_batches_type_time
                 ON email_batches (batch_type, sent_at);
 
+            CREATE TABLE IF NOT EXISTS grace_periods (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_id      TEXT    NOT NULL,
+                multiplier  REAL    NOT NULL,  -- e.g., 2.0 for doubling limits
+                expires_at  INTEGER NOT NULL,  -- Unix timestamp
+                created_at  INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_grace_periods_key
+                ON grace_periods (key_id, expires_at);
+
             CREATE TABLE IF NOT EXISTS key_costs (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_key_id    TEXT    NOT NULL,
@@ -338,6 +349,70 @@ class WatchdogDB:
         current_set = set(current_key_ids)
         # Skip if all current keys were in the last batch
         return current_set.issubset(last_keys)
+
+    # ------------------------------------------------------------------
+    # Grace periods (temporary limit increases)
+    # ------------------------------------------------------------------
+
+    def add_grace_period(
+        self,
+        key_id: str,
+        multiplier: float,
+        duration_seconds: int,
+    ) -> int:
+        """Add a grace period for a key. Returns the expires_at timestamp."""
+        now = int(time.time())
+        expires_at = now + duration_seconds
+        self.conn.execute(
+            "INSERT INTO grace_periods (key_id, multiplier, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (key_id, multiplier, expires_at, now),
+        )
+        self.conn.commit()
+        return expires_at
+
+    def get_grace_multiplier(self, key_id: str) -> float:
+        """Get the active grace multiplier for a key, or 1.0 if none active."""
+        now = int(time.time())
+        row = self.conn.execute(
+            "SELECT multiplier FROM grace_periods "
+            "WHERE key_id = ? AND expires_at > ? "
+            "ORDER BY expires_at DESC LIMIT 1",
+            (key_id, now),
+        ).fetchone()
+        return row[0] if row else 1.0
+
+    def list_active_grace_periods(self) -> list[tuple[str, float, int]]:
+        """List all active grace periods.
+
+        Returns list of (key_id, multiplier, expires_at).
+        """
+        now = int(time.time())
+        rows = self.conn.execute(
+            "SELECT key_id, multiplier, expires_at FROM grace_periods "
+            "WHERE expires_at > ? ORDER BY expires_at",
+            (now,),
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    def remove_grace_period(self, key_id: str) -> bool:
+        """Remove all grace periods for a key. Returns True if any were removed."""
+        cur = self.conn.execute(
+            "DELETE FROM grace_periods WHERE key_id = ?",
+            (key_id,),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def prune_expired_grace_periods(self) -> int:
+        """Remove expired grace periods. Returns count of removed entries."""
+        now = int(time.time())
+        cur = self.conn.execute(
+            "DELETE FROM grace_periods WHERE expires_at <= ?",
+            (now,),
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     # ------------------------------------------------------------------
     # Alert deduplication

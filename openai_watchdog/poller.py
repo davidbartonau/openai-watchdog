@@ -126,6 +126,9 @@ def run_poll_cycle(
         print(f"[poll]   Last 24h:      ${daily_total:.4f}")
         print(f"[poll] {'─' * 70}")
 
+    # Clean up expired grace periods
+    db.prune_expired_grace_periods()
+
     # Now evaluate rolling limits from the DB — per key, not per group.
     # Groups define the limits, but each key is checked individually.
     results = []
@@ -137,12 +140,17 @@ def run_poll_cycle(
             hourly = db.rolling_key_cost_hourly(key_id)
             daily = db.rolling_key_cost_daily(key_id)
 
+            # Check for active grace period (temporary limit increase)
+            grace_multiplier = db.get_grace_multiplier(key_id)
+
             # On first run we only have one big 24h chunk — hourly limits
             # are meaningless because the entire day's cost is stuffed into
             # a single record.  Only check daily limits until we have
             # granular per-interval data.
             result = _evaluate_key_limits(
-                key_id, group, hourly, daily, skip_hourly=first_run
+                key_id, group, hourly, daily,
+                skip_hourly=first_run,
+                grace_multiplier=grace_multiplier,
             )
             results.append(result)
 
@@ -170,31 +178,44 @@ def _evaluate_key_limits(
     daily_cost: float,
     *,
     skip_hourly: bool = False,
+    grace_multiplier: float = 1.0,
 ) -> dict:
-    """Evaluate limits for a single API key against its group's limits."""
+    """Evaluate limits for a single API key against its group's limits.
+
+    The grace_multiplier increases the effective limits for this key.
+    E.g., grace_multiplier=2.0 doubles the limits (100% increase).
+    """
     limits = group.limits
+
+    # Apply grace multiplier to limits
+    effective_hourly = limits.hourly * grace_multiplier if limits.hourly else None
+    effective_daily = limits.daily * grace_multiplier if limits.daily else None
+    effective_hard_hourly = limits.hard_hourly * grace_multiplier if limits.hard_hourly else None
+    effective_hard_daily = limits.hard_daily * grace_multiplier if limits.hard_daily else None
+
     result = {
         "key_id": key_id,
         "group": group.name,
         "hourly_cost": hourly_cost,
         "daily_cost": daily_cost,
-        "hourly_limit": limits.hourly,
-        "daily_limit": limits.daily,
-        "hard_hourly_limit": limits.hard_hourly,
-        "hard_daily_limit": limits.hard_daily,
+        "hourly_limit": effective_hourly,
+        "daily_limit": effective_daily,
+        "hard_hourly_limit": effective_hard_hourly,
+        "hard_daily_limit": effective_hard_daily,
+        "grace_multiplier": grace_multiplier,
         "soft_hourly_exceeded": False,
         "soft_daily_exceeded": False,
         "hard_hourly_exceeded": False,
         "hard_daily_exceeded": False,
     }
 
-    if limits.hourly is not None and not skip_hourly:
-        result["soft_hourly_exceeded"] = hourly_cost > limits.hourly
-        result["hard_hourly_exceeded"] = hourly_cost > limits.hard_hourly
+    if effective_hourly is not None and not skip_hourly:
+        result["soft_hourly_exceeded"] = hourly_cost > effective_hourly
+        result["hard_hourly_exceeded"] = hourly_cost > effective_hard_hourly
 
-    if limits.daily is not None:
-        result["soft_daily_exceeded"] = daily_cost > limits.daily
-        result["hard_daily_exceeded"] = daily_cost > limits.hard_daily
+    if effective_daily is not None:
+        result["soft_daily_exceeded"] = daily_cost > effective_daily
+        result["hard_daily_exceeded"] = daily_cost > effective_hard_daily
 
     return result
 

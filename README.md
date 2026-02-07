@@ -225,6 +225,31 @@ openai-watchdog status
 This reads the SQLite database and shows current rolling costs without
 making any API calls.  Useful for quick checks between poll cycles.
 
+### Temporary limit increases (grace periods)
+
+Use the `grace` command to temporarily increase limits for a specific key:
+
+```bash
+# Double limits for key abc123 for 2 days
+openai-watchdog grace --key key_abc123 --for 2d --increase 100
+
+# Triple limits for 4 hours
+openai-watchdog grace --key key_abc123 --for 4h --increase 200
+
+# List active grace periods
+openai-watchdog grace --list
+
+# Remove a grace period early
+openai-watchdog grace --remove key_abc123
+```
+
+The `--increase` value is a percentage:
+- `100` = double the limits (2x multiplier)
+- `200` = triple the limits (3x multiplier)
+- `50` = increase by 50% (1.5x multiplier)
+
+Grace periods are stored in the database and automatically expire.
+
 ## Limit logic
 
 For each key group, limits are checked against rolling windows:

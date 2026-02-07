@@ -507,6 +507,93 @@ def cmd_export(args: argparse.Namespace) -> None:
     print(f"Exported to {path}")
 
 
+def cmd_grace(args: argparse.Namespace) -> None:
+    """Manage temporary limit increases for API keys."""
+    from openai_watchdog.db import WatchdogDB
+
+    cfg = load_config(getattr(args, "config", None))
+    db_path = args.db or cfg.poll.db_path
+    db = WatchdogDB(db_path)
+    db.connect()
+
+    # List active grace periods
+    if args.list_active:
+        active = db.list_active_grace_periods()
+        if not active:
+            print("No active grace periods.")
+            return
+
+        print(f"{'Key ID':<28s} {'Multiplier':>12s} {'Expires':>22s}")
+        print("-" * 64)
+        for key_id, multiplier, expires_at in active:
+            expires_str = datetime.fromtimestamp(
+                expires_at, tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M UTC")
+            increase_pct = int((multiplier - 1) * 100)
+            print(f"{key_id:<28s} {multiplier:>10.1f}x (+{increase_pct}%) {expires_str:>22s}")
+        return
+
+    # Remove a grace period
+    if args.remove:
+        if db.remove_grace_period(args.remove):
+            print(f"Removed grace period for key {args.remove}")
+        else:
+            print(f"No active grace period found for key {args.remove}")
+        return
+
+    # Add a new grace period
+    if not args.key:
+        print("Error: --key is required to add a grace period", file=sys.stderr)
+        sys.exit(1)
+    if not args.duration:
+        print("Error: --for is required to specify duration (e.g., '2h', '1d')", file=sys.stderr)
+        sys.exit(1)
+    if args.increase is None:
+        print("Error: --increase is required (percentage, e.g., 100 = double)", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse duration
+    duration_str = args.duration.strip().lower()
+    if duration_str.endswith("h"):
+        duration_seconds = int(float(duration_str[:-1]) * 3600)
+    elif duration_str.endswith("d"):
+        duration_seconds = int(float(duration_str[:-1]) * 86400)
+    elif duration_str.endswith("m"):
+        duration_seconds = int(float(duration_str[:-1]) * 60)
+    else:
+        try:
+            duration_seconds = int(duration_str)
+        except ValueError:
+            print(f"Error: Invalid duration format '{args.duration}'", file=sys.stderr)
+            sys.exit(1)
+
+    # Calculate multiplier (100% increase = 2x multiplier)
+    multiplier = 1.0 + (args.increase / 100.0)
+
+    expires_at = db.add_grace_period(args.key, multiplier, duration_seconds)
+    expires_str = datetime.fromtimestamp(
+        expires_at, tz=timezone.utc
+    ).strftime("%Y-%m-%d %H:%M UTC")
+
+    print(f"Grace period added for key {args.key}")
+    print(f"  Limit multiplier: {multiplier:.1f}x (+{args.increase}%)")
+    print(f"  Expires: {expires_str}")
+    print(f"  Duration: {_format_duration(duration_seconds)}")
+
+
+def _format_duration(seconds: int) -> str:
+    """Format a duration in seconds as a human-readable string."""
+    if seconds >= 86400:
+        days = seconds / 86400
+        return f"{days:.1f} days" if days != int(days) else f"{int(days)} days"
+    elif seconds >= 3600:
+        hours = seconds / 3600
+        return f"{hours:.1f} hours" if hours != int(hours) else f"{int(hours)} hours"
+    else:
+        mins = seconds / 60
+        return f"{mins:.1f} minutes" if mins != int(mins) else f"{int(mins)} minutes"
+
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -718,6 +805,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory (default: from config or ./reports)",
     )
 
+    # --- grace (temporary limit increase) ---
+    p_grace = sub.add_parser(
+        "grace",
+        help="Manage temporary limit increases for API keys",
+    )
+    _add_common_args(p_grace)
+    p_grace.add_argument(
+        "--db", default=None,
+        help="Path to SQLite database (default: from config or watchdog.db)",
+    )
+    p_grace.add_argument(
+        "--key", default=None,
+        help="API key ID to grant grace period to",
+    )
+    p_grace.add_argument(
+        "--for", dest="duration", default=None,
+        help="Duration of grace period (e.g., '2h', '1d', '7d')",
+    )
+    p_grace.add_argument(
+        "--increase", type=int, default=None,
+        help="Percentage to increase limits (e.g., 100 = double, 200 = triple)",
+    )
+    p_grace.add_argument(
+        "--list", action="store_true", dest="list_active",
+        help="List all active grace periods",
+    )
+    p_grace.add_argument(
+        "--remove", default=None,
+        help="Remove grace period for this key ID",
+    )
+
     return parser
 
 
@@ -738,6 +856,7 @@ def main() -> None:
         "poll": cmd_poll,
         "status": cmd_status,
         "export": cmd_export,
+        "grace": cmd_grace,
     }
     commands[args.command](args)
 

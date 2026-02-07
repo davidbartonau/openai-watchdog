@@ -31,6 +31,8 @@ class GroupUsageSummary:
     estimated_cost_usd: float = 0.0
     # Per-model breakdown: model -> estimated cost
     model_costs: dict[str, float] = field(default_factory=dict)
+    # Per-key breakdown: api_key_id -> estimated cost
+    key_costs: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -98,6 +100,7 @@ def _accumulate_completions(summary: GroupUsageSummary, resp: UsageResponse) -> 
             cached = r.get("input_cached_tokens", 0) or 0
             reqs = r.get("num_model_requests", 0) or 0
             model = r.get("model", "unknown")
+            key_id = r.get("api_key_id", "")
 
             summary.total_input_tokens += inp
             summary.total_output_tokens += out
@@ -108,6 +111,8 @@ def _accumulate_completions(summary: GroupUsageSummary, resp: UsageResponse) -> 
             if cost is not None:
                 summary.estimated_cost_usd += cost
                 summary.model_costs[model] = summary.model_costs.get(model, 0.0) + cost
+                if key_id:
+                    summary.key_costs[key_id] = summary.key_costs.get(key_id, 0.0) + cost
 
 
 def _accumulate_embeddings(summary: GroupUsageSummary, resp: UsageResponse) -> None:
@@ -115,6 +120,7 @@ def _accumulate_embeddings(summary: GroupUsageSummary, resp: UsageResponse) -> N
         for r in bucket.results:
             inp = r.get("input_tokens", 0) or 0
             model = r.get("model", "unknown")
+            key_id = r.get("api_key_id", "")
 
             summary.total_input_tokens += inp
 
@@ -122,6 +128,8 @@ def _accumulate_embeddings(summary: GroupUsageSummary, resp: UsageResponse) -> N
             if cost is not None:
                 summary.estimated_cost_usd += cost
                 summary.model_costs[model] = summary.model_costs.get(model, 0.0) + cost
+                if key_id:
+                    summary.key_costs[key_id] = summary.key_costs.get(key_id, 0.0) + cost
 
 
 # ------------------------------------------------------------------

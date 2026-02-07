@@ -93,6 +93,17 @@ class WatchdogDB:
 
             CREATE INDEX IF NOT EXISTS idx_alerts_group_type
                 ON alerts_sent (group_name, alert_type, sent_at);
+
+            CREATE TABLE IF NOT EXISTS key_costs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key_id    TEXT    NOT NULL,
+                group_name    TEXT    NOT NULL,
+                poll_ts       INTEGER NOT NULL,
+                cost_usd      REAL    NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_key_costs_ts
+                ON key_costs (poll_ts);
         """)
 
     # ------------------------------------------------------------------
@@ -167,6 +178,43 @@ class WatchdogDB:
         return self.rolling_cost(group_name, 86400)
 
     # ------------------------------------------------------------------
+    # Per-key costs
+    # ------------------------------------------------------------------
+
+    def store_key_cost(
+        self,
+        api_key_id: str,
+        group_name: str,
+        poll_ts: int,
+        cost_usd: float,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO key_costs (api_key_id, group_name, poll_ts, cost_usd) "
+            "VALUES (?, ?, ?, ?)",
+            (api_key_id, group_name, poll_ts, cost_usd),
+        )
+        self.conn.commit()
+
+    def top_keys_by_cost(
+        self,
+        window_seconds: int = 86400,
+        limit: int = 5,
+    ) -> list[tuple[str, str, float]]:
+        """Return the top N most expensive API keys in the rolling window.
+
+        Returns list of (api_key_id, group_name, total_cost_usd).
+        """
+        cutoff = int(time.time()) - window_seconds
+        rows = self.conn.execute(
+            "SELECT api_key_id, group_name, SUM(cost_usd) as total "
+            "FROM key_costs WHERE poll_ts >= ? "
+            "GROUP BY api_key_id "
+            "ORDER BY total DESC LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    # ------------------------------------------------------------------
     # Alert deduplication
     # ------------------------------------------------------------------
 
@@ -211,6 +259,9 @@ class WatchdogDB:
             "DELETE FROM usage_records WHERE poll_ts < ?", (cutoff,)
         )
         deleted = cur.rowcount
+        self.conn.execute(
+            "DELETE FROM key_costs WHERE poll_ts < ?", (cutoff,)
+        )
         self.conn.execute(
             "DELETE FROM alerts_sent WHERE sent_at < ?", (cutoff,)
         )

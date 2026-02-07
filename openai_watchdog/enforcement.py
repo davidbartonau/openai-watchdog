@@ -291,6 +291,13 @@ def _send_batched_email(
                 "DELETED automatically.\n"
             )
 
+        # Collect key creators' emails to CC them on the alert
+        key_creator_emails = []
+        for alert in owner_alerts:
+            # alert.owner contains the key creator's email (if it's a user key)
+            if alert.owner and "@" in alert.owner:
+                key_creator_emails.append(alert.owner)
+
         # Build the key details table
         body = intro
         body += "Keys over limit:\n"
@@ -317,6 +324,7 @@ def _send_batched_email(
             to_addr=owner_email,
             subject=subject,
             body=body,
+            extra_cc=key_creator_emails,
             verbose=verbose,
         )
 
@@ -378,15 +386,29 @@ def _send_email(
     to_addr: str,
     subject: str,
     body: str,
+    extra_cc: list[str] | None = None,
     verbose: bool = False,
 ) -> bool:
-    """Send an alert email via SMTP."""
+    """Send an alert email via SMTP.
+
+    Args:
+        extra_cc: Additional CC recipients (e.g., key creators) beyond
+                  the configured cc_addrs.
+    """
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = settings.from_addr
     msg["To"] = to_addr
-    if settings.cc_addrs:
-        msg["Cc"] = ", ".join(settings.cc_addrs)
+
+    # Combine configured CC addresses with extra CC (key creators)
+    all_cc = list(settings.cc_addrs)
+    if extra_cc:
+        for addr in extra_cc:
+            if addr and addr not in all_cc and addr != to_addr:
+                all_cc.append(addr)
+    if all_cc:
+        msg["Cc"] = ", ".join(all_cc)
+
     msg.set_content(body)
 
     password = settings.get_password()
@@ -399,7 +421,7 @@ def _send_email(
                 smtp.login(settings.username, password)
             smtp.send_message(msg)
         if verbose:
-            cc_str = f" (cc: {', '.join(settings.cc_addrs)})" if settings.cc_addrs else ""
+            cc_str = f" (cc: {', '.join(all_cc)})" if all_cc else ""
             print(f"[enforce] Email sent to {to_addr}{cc_str}: {subject}")
         return True
     except Exception as exc:

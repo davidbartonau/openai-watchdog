@@ -170,17 +170,15 @@ def _process_hard_alerts(
         # Delete the key
         _delete_api_key(admin_key, alert.key_id, verbose=verbose)
 
-        # Post webhook
-        if cfg.alerts.webhook_url:
-            _post_webhook_key(
-                cfg.alerts.webhook_url, alert.alert_type, alert.key_id,
-                alert.key_name, alert.owner, alert.group_name,
-                alert.cost, alert.limit
-            )
-
         # Record alert
         alert_key = f"{alert.key_id}:{alert.alert_type}"
         db.record_alert(alert_key, alert.alert_type, alert.cost, alert.limit)
+
+    # Post batch webhook with all hard limit keys
+    if cfg.alerts.webhook_url:
+        _post_webhook_batch(
+            cfg.alerts.webhook_url, new_alerts, is_hard=True, verbose=verbose
+        )
 
     # Send batched email with all hard limit keys (with smart cooldown)
     if cfg.alerts.email.configured:
@@ -223,17 +221,15 @@ def _process_soft_alerts(
         if cfg.alerts.stdout:
             print(msg, file=sys.stderr)
 
-        # Post webhook
-        if cfg.alerts.webhook_url:
-            _post_webhook_key(
-                cfg.alerts.webhook_url, alert.alert_type, alert.key_id,
-                alert.key_name, alert.owner, alert.group_name,
-                alert.cost, alert.limit
-            )
-
         # Record alert
         alert_key = f"{alert.key_id}:{alert.alert_type}"
         db.record_alert(alert_key, alert.alert_type, alert.cost, alert.limit)
+
+    # Post batch webhook with all soft limit keys
+    if cfg.alerts.webhook_url:
+        _post_webhook_batch(
+            cfg.alerts.webhook_url, new_alerts, is_hard=False, verbose=verbose
+        )
 
     # Send batched email with all soft limit keys (with smart cooldown)
     if cfg.alerts.email.configured:
@@ -415,26 +411,49 @@ def _send_email(
 # Webhook
 # ------------------------------------------------------------------
 
-def _post_webhook_key(
+def _post_webhook_batch(
     url: str,
-    alert_type: str,
-    key_id: str,
-    key_name: str,
-    owner: str,
-    group_name: str,
-    cost: float,
-    limit: float,
+    alerts: list[KeyAlert],
+    *,
+    is_hard: bool,
+    verbose: bool = False,
 ) -> None:
-    """Post webhook for a single key alert."""
+    """Post webhook with all alerts in a single batch request.
+
+    Sends a JSON payload with:
+    - event_type: "hard_limit" or "soft_limit"
+    - timestamp: ISO format timestamp
+    - keys: array of key details
+    """
+    import time
+    from datetime import datetime, timezone
+
+    if not alerts:
+        return
+
+    event_type = "hard_limit" if is_hard else "soft_limit"
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    keys_data = []
+    for alert in alerts:
+        keys_data.append({
+            "key_id": alert.key_id,
+            "key_name": alert.key_name,
+            "owner": alert.owner,
+            "group": alert.group_name,
+            "alert_type": alert.alert_type,
+            "cost_usd": round(alert.cost, 6),
+            "limit_usd": alert.limit,
+            "hard_limit_usd": alert.hard_limit,
+        })
+
     payload = {
-        "event": alert_type,
-        "key_id": key_id,
-        "key_name": key_name,
-        "owner": owner,
-        "group": group_name,
-        "cost_usd": round(cost, 6),
-        "limit_usd": limit,
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "keys_count": len(keys_data),
+        "keys": keys_data,
     }
+
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url,
@@ -444,6 +463,7 @@ def _post_webhook_key(
     )
     try:
         with urllib.request.urlopen(req, timeout=10):
-            pass
+            if verbose:
+                print(f"[enforce] Webhook batch sent: {len(keys_data)} key(s)")
     except (urllib.error.URLError, OSError) as exc:
         print(f"[enforce] Webhook POST failed: {exc}", file=sys.stderr)

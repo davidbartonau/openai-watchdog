@@ -316,6 +316,43 @@ uses the OpenAI Admin API to DELETE the offending API key:
 **Note:** OpenAI does not provide a way to disable keys — they can only be
 deleted. To restore access, an admin must create a new API key.
 
+## Webhook payload
+
+When `alerts.webhook_url` is configured, the watchdog sends a batch JSON
+payload for each limit breach event:
+
+```json
+{
+  "event_type": "soft_limit",
+  "timestamp": "2024-01-15T10:30:00+00:00",
+  "keys_count": 2,
+  "keys": [
+    {
+      "key_id": "key_abc123",
+      "key_name": "Production API",
+      "owner": "alice@example.com",
+      "group": "team-alpha",
+      "alert_type": "soft_hourly",
+      "cost_usd": 25.50,
+      "limit_usd": 20.00,
+      "hard_limit_usd": 60.00
+    },
+    {
+      "key_id": "key_def456",
+      "key_name": "Dev API",
+      "owner": "bob@example.com",
+      "group": "team-alpha",
+      "alert_type": "soft_daily",
+      "cost_usd": 45.00,
+      "limit_usd": 30.00,
+      "hard_limit_usd": 90.00
+    }
+  ]
+}
+```
+
+The `event_type` is either `soft_limit` or `hard_limit`.
+
 ## Database
 
 The poller stores all data in a local **SQLite** database (`watchdog.db` by

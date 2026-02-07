@@ -1,0 +1,13 @@
+[project]
+name = "openai-watchdog"
+version = "0.1.0"
+description = "CLI tool to monitor and report on OpenAI API usage and costs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+openai-watchdog = "openai_watchdog.cli:main"

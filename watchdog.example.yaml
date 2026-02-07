@@ -4,24 +4,48 @@
 # Environment variable containing the OpenAI Admin API key.
 admin_key_env: OPENAI_ADMIN_KEY
 
+# Poller settings (used by `openai-watchdog poll`).
+poll:
+  interval_seconds: 600    # 10 minutes
+  db_path: watchdog.db     # SQLite database for usage history
+
 # Key groups: name each group and list API key IDs that belong to it.
-# Optionally set a max spend rate to trigger alerts.
+# Set hourly/daily spend limits.  Hard limit = soft * hard_multiplier.
+#
+# Soft limit  → email the owner with a warning.
+# Hard limit  → restrict the key to read-only via OpenAI Admin API.
 key_groups:
   team-alpha:
     api_key_ids:
       - sk-proj-abc123...
       - sk-proj-def456...
-    max_dollars_per_hour: 5.0
+    owner_email: alice@example.com
+    limits:
+      hourly: 20.0           # soft limit: $20/hour
+      daily: 30.0            # soft limit: $30/day
+      hard_multiplier: 1.5   # hard limit = soft * 1.5 ($30/h, $45/day)
 
   team-beta:
     api_key_ids:
       - sk-proj-ghi789...
-    max_dollars_per_hour: 10.0
+    owner_email: bob@example.com
+    limits:
+      hourly: 10.0
+      daily: 50.0
+      # hard_multiplier defaults to 1.5
 
-# Alert settings (triggered by `openai-watchdog watch`).
+# Alert settings (triggered by soft/hard limit breaches).
 alerts:
   stdout: true
   # webhook_url: https://hooks.slack.com/services/...
+
+  # SMTP email settings (for emailing key owners on limit breach).
+  # email:
+  #   smtp_host: smtp.example.com
+  #   smtp_port: 587
+  #   from_addr: watchdog@example.com
+  #   username: watchdog@example.com
+  #   password_env: SMTP_PASSWORD    # reads password from this env var
 
 # Export settings (used by `openai-watchdog export` and --export flags).
 export:

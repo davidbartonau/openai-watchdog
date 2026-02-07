@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from openai_watchdog.usage import UsageClient, USAGE_ENDPOINTS, days_ago, hours_
 
 
 def _get_admin_key(config_path=None) -> str:
-    """Resolve admin key: config → OPENAI_ADMIN_KEY → OPENAI_API_KEY."""
+    """Resolve admin key: config -> OPENAI_ADMIN_KEY -> OPENAI_API_KEY."""
     cfg = load_config(config_path)
     key = cfg.get_admin_key()
     if not key:
@@ -168,8 +169,14 @@ def cmd_groups(args: argparse.Namespace) -> None:
             for model, cost in sorted(summary.model_costs.items(),
                                       key=lambda x: x[1], reverse=True):
                 print(f"    {model:<40s} ${cost:.4f}")
-        if group.max_dollars_per_hour is not None:
-            print(f"  Rate limit: ${group.max_dollars_per_hour:.2f}/h")
+        limits = group.limits
+        if limits.has_any_limit:
+            parts = []
+            if limits.hourly is not None:
+                parts.append(f"${limits.hourly:.2f}/h (hard ${limits.hard_hourly:.2f})")
+            if limits.daily is not None:
+                parts.append(f"${limits.daily:.2f}/day (hard ${limits.hard_daily:.2f})")
+            print(f"  Limits: {', '.join(parts)}")
         print()
 
     if args.export:
@@ -180,7 +187,7 @@ def cmd_groups(args: argparse.Namespace) -> None:
 
 
 def cmd_watch(args: argparse.Namespace) -> None:
-    """Check rate limits and fire alerts if thresholds are exceeded."""
+    """One-shot rate-limit check (legacy).  Use `poll` for continuous monitoring."""
     from openai_watchdog.monitor import check_rate_limits, send_alerts
     from openai_watchdog.export import export_rate_limit_checks
 
@@ -190,9 +197,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
         return
 
     groups_with_limits = [g for g in cfg.key_groups.values()
-                          if g.max_dollars_per_hour is not None]
+                          if g.limits.has_any_limit]
     if not groups_with_limits:
-        print("No rate limits configured. Set max_dollars_per_hour on key groups.")
+        print("No rate limits configured. Set limits on key groups.")
         return
 
     client = UsageClient(_get_admin_key(getattr(args, "config", None)))
@@ -217,8 +224,126 @@ def cmd_watch(args: argparse.Namespace) -> None:
         path = export_rate_limit_checks(checks, fmt=fmt, output_dir=out_dir)
         print(f"Exported to {path}")
 
-    # Exit with non-zero if any limits exceeded (useful for cron/CI)
     if breaches:
+        sys.exit(1)
+
+
+def cmd_poll(args: argparse.Namespace) -> None:
+    """Run the usage poller (one-shot or continuous loop).
+
+    One-shot:   openai-watchdog poll --once
+    Continuous: openai-watchdog poll           (runs every interval_seconds)
+    """
+    from openai_watchdog.db import WatchdogDB
+    from openai_watchdog.poller import run_poll_cycle
+
+    cfg = load_config(getattr(args, "config", None))
+    if not cfg.key_groups:
+        print("No key groups configured. Add key_groups to watchdog.yaml.")
+        return
+
+    client = UsageClient(_get_admin_key(getattr(args, "config", None)))
+    db = WatchdogDB(args.db or cfg.poll.db_path)
+    db.connect()
+    interval = args.interval or cfg.poll.interval_seconds
+
+    if args.once:
+        print(f"[poll] Running single poll cycle...")
+        results = run_poll_cycle(cfg, client, db, verbose=True)
+        _print_poll_summary(results)
+        db.close()
+        # Exit non-zero if any hard limits exceeded.
+        if any(r.get("hard_hourly_exceeded") or r.get("hard_daily_exceeded")
+               for r in results):
+            sys.exit(2)
+        if any(r.get("soft_hourly_exceeded") or r.get("soft_daily_exceeded")
+               for r in results):
+            sys.exit(1)
+        return
+
+    # Continuous loop.
+    print(f"[poll] Starting continuous polling every {interval}s "
+          f"({interval / 60:.0f} min).  Ctrl-C to stop.")
+
+    # Handle graceful shutdown.
+    running = True
+
+    def _shutdown(signum, frame):
+        nonlocal running
+        print("\n[poll] Shutting down...")
+        running = False
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    while running:
+        try:
+            results = run_poll_cycle(cfg, client, db, verbose=True)
+            _print_poll_summary(results)
+        except Exception as exc:
+            print(f"[poll] ERROR in poll cycle: {exc}", file=sys.stderr)
+
+        # Sleep in small increments so we can respond to signals.
+        deadline = time.time() + interval
+        while running and time.time() < deadline:
+            time.sleep(min(1.0, deadline - time.time()))
+
+    db.close()
+    print("[poll] Stopped.")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    """Show current rolling costs from the database."""
+    from openai_watchdog.db import WatchdogDB
+
+    cfg = load_config(getattr(args, "config", None))
+    db = WatchdogDB(args.db or cfg.poll.db_path)
+    db.connect()
+
+    last_poll = db.last_successful_poll_ts()
+    if last_poll is None:
+        print("No poll data yet. Run `openai-watchdog poll --once` first.")
+        db.close()
+        return
+
+    print(f"Last poll: {_ts_label(last_poll)}")
+    print()
+
+    any_breach = False
+    for name, group in cfg.key_groups.items():
+        hourly = db.rolling_cost_hourly(name)
+        daily = db.rolling_cost_daily(name)
+
+        h_limit = group.limits.hourly
+        d_limit = group.limits.daily
+        h_hard = group.limits.hard_hourly
+        d_hard = group.limits.hard_daily
+
+        flags = []
+        if h_limit and hourly > h_limit:
+            flags.append("SOFT-HOURLY")
+        if d_limit and daily > d_limit:
+            flags.append("SOFT-DAILY")
+        if h_hard and hourly > h_hard:
+            flags.append("HARD-HOURLY")
+        if d_hard and daily > d_hard:
+            flags.append("HARD-DAILY")
+        if flags:
+            any_breach = True
+
+        status = ", ".join(flags) if flags else "OK"
+
+        h_str = f"${hourly:.4f}"
+        if h_limit:
+            h_str += f" / ${h_limit:.2f}"
+        d_str = f"${daily:.4f}"
+        if d_limit:
+            d_str += f" / ${d_limit:.2f}"
+
+        print(f"  {name:<25s}  1h: {h_str:<20s}  24h: {d_str:<20s}  [{status}]")
+
+    db.close()
+    if any_breach:
         sys.exit(1)
 
 
@@ -312,6 +437,20 @@ def _print_result_row(btype: str, r: dict, group_by: list[str]) -> None:
     print(f"    {dim_str:<50s} {metrics_str}{cost_str}")
 
 
+def _print_poll_summary(results: list[dict]) -> None:
+    """Print a compact summary line after a poll cycle."""
+    soft = sum(1 for r in results
+               if r.get("soft_hourly_exceeded") or r.get("soft_daily_exceeded"))
+    hard = sum(1 for r in results
+               if r.get("hard_hourly_exceeded") or r.get("hard_daily_exceeded"))
+    if hard:
+        print(f"[poll] {hard} group(s) at HARD limit, {soft} at soft limit")
+    elif soft:
+        print(f"[poll] {soft} group(s) at soft limit")
+    else:
+        print(f"[poll] All {len(results)} group(s) within limits")
+
+
 # ------------------------------------------------------------------
 # Argument parser
 # ------------------------------------------------------------------
@@ -378,10 +517,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_groups.add_argument("--export-format", choices=["csv", "json"], default=None)
     p_groups.add_argument("--export-dir", default=None)
 
-    # --- watch ---
+    # --- watch (legacy one-shot) ---
     p_watch = sub.add_parser(
         "watch",
-        help="Check rate limits and alert on breaches",
+        help="One-shot rate-limit check (use `poll` for continuous)",
     )
     _add_common_args(p_watch)
     p_watch.add_argument(
@@ -390,6 +529,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_watch.add_argument("--export-format", choices=["csv", "json"], default=None)
     p_watch.add_argument("--export-dir", default=None)
+
+    # --- poll (new: periodic monitoring with DB) ---
+    p_poll = sub.add_parser(
+        "poll",
+        help="Periodic usage polling with rolling limits and enforcement",
+    )
+    _add_common_args(p_poll)
+    p_poll.add_argument(
+        "--once", action="store_true",
+        help="Run a single poll cycle and exit",
+    )
+    p_poll.add_argument(
+        "--interval", type=int, default=None,
+        help="Poll interval in seconds (default: from config or 600)",
+    )
+    p_poll.add_argument(
+        "--db", default=None,
+        help="Path to SQLite database (default: from config or watchdog.db)",
+    )
+
+    # --- status (query rolling costs from DB) ---
+    p_status = sub.add_parser(
+        "status",
+        help="Show current rolling costs from the poll database",
+    )
+    _add_common_args(p_status)
+    p_status.add_argument(
+        "--db", default=None,
+        help="Path to SQLite database (default: from config or watchdog.db)",
+    )
 
     # --- export ---
     p_export = sub.add_parser("export", help="Export raw usage data to CSV/JSON")
@@ -426,6 +595,8 @@ def main() -> None:
         "prices": cmd_prices,
         "groups": cmd_groups,
         "watch": cmd_watch,
+        "poll": cmd_poll,
+        "status": cmd_status,
         "export": cmd_export,
     }
     commands[args.command](args)

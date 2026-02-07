@@ -108,6 +108,7 @@ class EmailSettings:
     username: str = ""
     password_env: str = "SMTP_PASSWORD"
     cc_addrs: list[str] = field(default_factory=list)
+    cooldown_seconds: int = 3600  # Default 1 hour cooldown
 
     @property
     def configured(self) -> bool:
@@ -258,6 +259,7 @@ def _parse_config(raw: dict[str, Any]) -> WatchdogConfig:
                 username=email_raw.get("username", ""),
                 password_env=email_raw.get("password_env", "SMTP_PASSWORD"),
                 cc_addrs=cc_raw,
+                cooldown_seconds=email_raw.get("cooldown_seconds", 3600),
             )
         cfg.alerts = AlertSettings(
             stdout=alerts_raw.get("stdout", True),

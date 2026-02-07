@@ -141,11 +141,13 @@ def _process_hard_alerts(
     if not alerts:
         return
 
+    cooldown = cfg.alerts.email.cooldown_seconds
+
     # Filter out alerts that were already sent recently
     new_alerts = []
     for alert in alerts:
         alert_key = f"{alert.key_id}:{alert.alert_type}"
-        if db.was_alert_sent_recently(alert_key, alert.alert_type, cooldown_seconds=3600):
+        if db.was_alert_sent_recently(alert_key, alert.alert_type, cooldown_seconds=cooldown):
             if verbose:
                 print(f"[enforce] {alert.key_id}: {alert.alert_type} already enforced recently")
             continue
@@ -180,9 +182,9 @@ def _process_hard_alerts(
         alert_key = f"{alert.key_id}:{alert.alert_type}"
         db.record_alert(alert_key, alert.alert_type, alert.cost, alert.limit)
 
-    # Send batched email with all hard limit keys
+    # Send batched email with all hard limit keys (with smart cooldown)
     if cfg.alerts.email.configured:
-        _send_batched_email(new_alerts, cfg, is_hard=True, verbose=verbose)
+        _send_batched_email(new_alerts, cfg, db, is_hard=True, verbose=verbose)
 
 
 def _process_soft_alerts(
@@ -195,11 +197,13 @@ def _process_soft_alerts(
     if not alerts:
         return
 
+    cooldown = cfg.alerts.email.cooldown_seconds
+
     # Filter out alerts that were already sent recently
     new_alerts = []
     for alert in alerts:
         alert_key = f"{alert.key_id}:{alert.alert_type}"
-        if db.was_alert_sent_recently(alert_key, alert.alert_type, cooldown_seconds=3600):
+        if db.was_alert_sent_recently(alert_key, alert.alert_type, cooldown_seconds=cooldown):
             if verbose:
                 print(f"[enforce] {alert.key_id}: {alert.alert_type} alert already sent recently")
             continue
@@ -231,20 +235,35 @@ def _process_soft_alerts(
         alert_key = f"{alert.key_id}:{alert.alert_type}"
         db.record_alert(alert_key, alert.alert_type, alert.cost, alert.limit)
 
-    # Send batched email with all soft limit keys
+    # Send batched email with all soft limit keys (with smart cooldown)
     if cfg.alerts.email.configured:
-        _send_batched_email(new_alerts, cfg, is_hard=False, verbose=verbose)
+        _send_batched_email(new_alerts, cfg, db, is_hard=False, verbose=verbose)
 
 
 def _send_batched_email(
     alerts: list[KeyAlert],
     cfg: WatchdogConfig,
+    db: WatchdogDB,
     *,
     is_hard: bool,
     verbose: bool,
 ) -> None:
-    """Send a single email listing all over-limit keys."""
+    """Send a single email listing all over-limit keys.
+
+    Uses smart cooldown: if all current keys were in the previous email
+    batch within the cooldown period, skip sending the email.
+    """
     if not alerts:
+        return
+
+    batch_type = "hard" if is_hard else "soft"
+    cooldown = cfg.alerts.email.cooldown_seconds
+    current_key_ids = [a.key_id for a in alerts]
+
+    # Check if we should skip this email (smart cooldown)
+    if db.should_skip_email(batch_type, current_key_ids, cooldown):
+        if verbose:
+            print(f"[enforce] Skipping {batch_type} email: all keys were in previous alert")
         return
 
     # Group alerts by owner_email (from the group config)
@@ -304,6 +323,9 @@ def _send_batched_email(
             body=body,
             verbose=verbose,
         )
+
+    # Record this email batch for smart cooldown
+    db.record_email_batch(batch_type, current_key_ids)
 
 
 # ------------------------------------------------------------------

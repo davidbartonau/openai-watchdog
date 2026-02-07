@@ -94,6 +94,16 @@ class WatchdogDB:
             CREATE INDEX IF NOT EXISTS idx_alerts_group_type
                 ON alerts_sent (group_name, alert_type, sent_at);
 
+            CREATE TABLE IF NOT EXISTS email_batches (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_type  TEXT    NOT NULL,   -- 'soft' or 'hard'
+                sent_at     INTEGER NOT NULL,
+                key_ids     TEXT    NOT NULL    -- JSON array of key IDs
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_email_batches_type_time
+                ON email_batches (batch_type, sent_at);
+
             CREATE TABLE IF NOT EXISTS key_costs (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_key_id    TEXT    NOT NULL,
@@ -268,6 +278,68 @@ class WatchdogDB:
         return [(r[0], r[1], r[2]) for r in rows]
 
     # ------------------------------------------------------------------
+    # Email batch tracking (for smart cooldown)
+    # ------------------------------------------------------------------
+
+    def record_email_batch(
+        self,
+        batch_type: str,  # 'soft' or 'hard'
+        key_ids: list[str],
+    ) -> None:
+        """Record that an email was sent with the given key IDs."""
+        import json
+        self.conn.execute(
+            "INSERT INTO email_batches (batch_type, sent_at, key_ids) VALUES (?, ?, ?)",
+            (batch_type, int(time.time()), json.dumps(key_ids)),
+        )
+        self.conn.commit()
+
+    def get_last_batch_keys(
+        self,
+        batch_type: str,
+        cooldown_seconds: int = 3600,
+    ) -> set[str]:
+        """Get the key IDs from the most recent email batch within the cooldown."""
+        import json
+        cutoff = int(time.time()) - cooldown_seconds
+        row = self.conn.execute(
+            "SELECT key_ids FROM email_batches "
+            "WHERE batch_type = ? AND sent_at >= ? "
+            "ORDER BY sent_at DESC LIMIT 1",
+            (batch_type, cutoff),
+        ).fetchone()
+        if row:
+            return set(json.loads(row[0]))
+        return set()
+
+    def should_skip_email(
+        self,
+        batch_type: str,
+        current_key_ids: list[str],
+        cooldown_seconds: int = 3600,
+    ) -> bool:
+        """Check if we should skip sending an email.
+
+        Returns True if:
+        - There was a recent email batch (within cooldown)
+        - All current keys are a subset of the keys in that batch
+
+        This means: if we alerted A, B, C and now A, B are over, skip.
+        But if A, B, D are over, send because D is new.
+        """
+        if not current_key_ids:
+            return True
+
+        last_keys = self.get_last_batch_keys(batch_type, cooldown_seconds)
+        if not last_keys:
+            # No recent batch, don't skip
+            return False
+
+        current_set = set(current_key_ids)
+        # Skip if all current keys were in the last batch
+        return current_set.issubset(last_keys)
+
+    # ------------------------------------------------------------------
     # Alert deduplication
     # ------------------------------------------------------------------
 
@@ -317,6 +389,9 @@ class WatchdogDB:
         )
         self.conn.execute(
             "DELETE FROM alerts_sent WHERE sent_at < ?", (cutoff,)
+        )
+        self.conn.execute(
+            "DELETE FROM email_batches WHERE sent_at < ?", (cutoff,)
         )
         self.conn.execute(
             "DELETE FROM poll_runs WHERE finished_at < ? AND finished_at > 0",

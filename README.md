@@ -168,6 +168,7 @@ export:
 | `alerts.email.username` | SMTP login username | (optional) |
 | `alerts.email.password_env` | Env var containing SMTP password | `SMTP_PASSWORD` |
 | `alerts.email.cc_addrs` | List of CC addresses for all alert emails | `[]` |
+| `alerts.email.cooldown_seconds` | Cooldown period for smart email deduplication | `3600` (1 hour) |
 | `export.format` | Export format: `csv` or `json` | `csv` |
 | `export.output_dir` | Directory for exported reports | `./reports` |
 
@@ -296,8 +297,12 @@ key_groups:
 - **Hard limit breach:** a notification that keys have been deleted, with
   instructions to contact an admin to create new keys.
 
-Alerts have a **1-hour cooldown** per group per alert type — you won't get
-spammed with the same alert every 10 minutes.
+Alerts have a **smart cooldown** (default 1 hour, configurable via
+`cooldown_seconds`):
+- If all over-limit keys were already in the previous alert, the email is skipped
+- If any new key exceeds limits, a new email is sent with all over-limit keys
+- Example: if keys A, B, C were alerted, then A, B are still over — skip.
+  But if A, B, D are over — send a new email because D is new.
 
 ## Key deletion (hard limit enforcement)
 

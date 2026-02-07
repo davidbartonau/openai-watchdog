@@ -567,17 +567,20 @@ def _print_result_row(btype: str, r: dict, group_by: list[str]) -> None:
 
 
 def _print_poll_summary(results: list[dict]) -> None:
-    """Print a compact summary line after a poll cycle."""
+    """Print a compact summary line after a poll cycle.
+
+    Results are now per-key, not per-group.
+    """
     soft = sum(1 for r in results
                if r.get("soft_hourly_exceeded") or r.get("soft_daily_exceeded"))
     hard = sum(1 for r in results
                if r.get("hard_hourly_exceeded") or r.get("hard_daily_exceeded"))
     if hard:
-        print(f"[poll] {hard} group(s) at HARD limit, {soft} at soft limit")
+        print(f"[poll] {hard} key(s) at HARD limit, {soft} at soft limit")
     elif soft:
-        print(f"[poll] {soft} group(s) at soft limit")
+        print(f"[poll] {soft} key(s) at soft limit")
     else:
-        print(f"[poll] All {len(results)} group(s) within limits")
+        print(f"[poll] All {len(results)} key(s) within limits")
 
 
 # ------------------------------------------------------------------

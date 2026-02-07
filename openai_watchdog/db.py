@@ -233,6 +233,40 @@ class WatchdogDB:
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
+    def rolling_key_cost(self, api_key_id: str, window_seconds: int) -> float:
+        """Sum of cost_usd for a specific API key within the last *window_seconds*."""
+        cutoff = int(time.time()) - window_seconds
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM key_costs "
+            "WHERE api_key_id = ? AND poll_ts >= ?",
+            (api_key_id, cutoff),
+        ).fetchone()
+        return row[0]
+
+    def rolling_key_cost_hourly(self, api_key_id: str) -> float:
+        return self.rolling_key_cost(api_key_id, 3600)
+
+    def rolling_key_cost_daily(self, api_key_id: str) -> float:
+        return self.rolling_key_cost(api_key_id, 86400)
+
+    def all_keys_with_costs(
+        self,
+        window_seconds: int,
+    ) -> list[tuple[str, str, float]]:
+        """Return all keys with their rolling costs.
+
+        Returns list of (api_key_id, group_name, total_cost_usd).
+        """
+        cutoff = int(time.time()) - window_seconds
+        rows = self.conn.execute(
+            "SELECT api_key_id, group_name, SUM(cost_usd) as total "
+            "FROM key_costs WHERE poll_ts >= ? "
+            "GROUP BY api_key_id "
+            "ORDER BY total DESC",
+            (cutoff,),
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
     # ------------------------------------------------------------------
     # Alert deduplication
     # ------------------------------------------------------------------

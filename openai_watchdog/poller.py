@@ -42,12 +42,17 @@ def run_poll_cycle(
 ) -> list[dict]:
     """Execute one poll cycle.  Returns a list of limit-check results.
 
-    Each result dict has::
+    Each result dict has (one per key, not per group)::
 
         {
+            "key_id": str,
             "group": str,
             "hourly_cost": float,
             "daily_cost": float,
+            "hourly_limit": float,
+            "daily_limit": float,
+            "hard_hourly_limit": float,
+            "hard_daily_limit": float,
             "soft_hourly_exceeded": bool,
             "soft_daily_exceeded": bool,
             "hard_hourly_exceeded": bool,
@@ -121,25 +126,29 @@ def run_poll_cycle(
         print(f"[poll]   Last 24h:      ${daily_total:.4f}")
         print(f"[poll] {'─' * 70}")
 
-    # Now evaluate rolling limits from the DB.
+    # Now evaluate rolling limits from the DB — per key, not per group.
+    # Groups define the limits, but each key is checked individually.
     results = []
     for group in cfg.key_groups.values():
         if not group.limits.has_any_limit:
             continue
 
-        hourly = db.rolling_cost_hourly(group.name)
-        daily = db.rolling_cost_daily(group.name)
+        for key_id in group.api_key_ids:
+            hourly = db.rolling_key_cost_hourly(key_id)
+            daily = db.rolling_key_cost_daily(key_id)
 
-        # On first run we only have one big 24h chunk — hourly limits
-        # are meaningless because the entire day's cost is stuffed into
-        # a single record.  Only check daily limits until we have
-        # granular per-interval data.
-        result = _evaluate_limits(group, hourly, daily,
-                                  skip_hourly=first_run)
-        results.append(result)
+            # On first run we only have one big 24h chunk — hourly limits
+            # are meaningless because the entire day's cost is stuffed into
+            # a single record.  Only check daily limits until we have
+            # granular per-interval data.
+            result = _evaluate_key_limits(
+                key_id, group, hourly, daily, skip_hourly=first_run
+            )
+            results.append(result)
 
-        if verbose:
-            _print_result(result, group, skip_hourly=first_run)
+    # Print group summaries (aggregate for display only)
+    if verbose:
+        _print_group_summaries(results, cfg, skip_hourly=first_run)
 
     # Print top N most expensive keys (last 24h).
     if verbose and show_top > 0:
@@ -154,15 +163,18 @@ def run_poll_cycle(
     return results
 
 
-def _evaluate_limits(
+def _evaluate_key_limits(
+    key_id: str,
     group: KeyGroup,
     hourly_cost: float,
     daily_cost: float,
     *,
     skip_hourly: bool = False,
 ) -> dict:
+    """Evaluate limits for a single API key against its group's limits."""
     limits = group.limits
     result = {
+        "key_id": key_id,
         "group": group.name,
         "hourly_cost": hourly_cost,
         "daily_cost": daily_cost,
@@ -187,30 +199,56 @@ def _evaluate_limits(
     return result
 
 
-def _print_result(result: dict, group: KeyGroup, *, skip_hourly: bool = False) -> None:
-    flags = []
-    if result["soft_hourly_exceeded"]:
-        flags.append("SOFT-HOURLY")
-    if result["soft_daily_exceeded"]:
-        flags.append("SOFT-DAILY")
-    if result["hard_hourly_exceeded"]:
-        flags.append("HARD-HOURLY")
-    if result["hard_daily_exceeded"]:
-        flags.append("HARD-DAILY")
+def _print_group_summaries(
+    results: list[dict],
+    cfg: WatchdogConfig,
+    *,
+    skip_hourly: bool = False,
+) -> None:
+    """Print per-group summary with key-level status indicators."""
+    # Group results by group name
+    by_group: dict[str, list[dict]] = {}
+    for r in results:
+        by_group.setdefault(r["group"], []).append(r)
 
-    status = ", ".join(flags) if flags else "OK"
-    h_part = (
-        f"1h=${result['hourly_cost']:.4f}"
-        f"{'/' + f'${group.limits.hourly:.2f}' if group.limits.hourly else ''}"
-        if not skip_hourly else "1h=n/a (first run)"
-    )
-    print(
-        f"[poll] {group.name}:  "
-        f"{h_part}  "
-        f"24h=${result['daily_cost']:.4f}"
-        f"{'/' + f'${group.limits.daily:.2f}' if group.limits.daily else ''}  "
-        f"[{status}]"
-    )
+    for group_name, group_results in by_group.items():
+        group = cfg.key_groups.get(group_name)
+        if not group:
+            continue
+
+        # Aggregate costs for display
+        total_hourly = sum(r["hourly_cost"] for r in group_results)
+        total_daily = sum(r["daily_cost"] for r in group_results)
+
+        # Count keys exceeding limits
+        soft_hourly_count = sum(1 for r in group_results if r["soft_hourly_exceeded"])
+        soft_daily_count = sum(1 for r in group_results if r["soft_daily_exceeded"])
+        hard_hourly_count = sum(1 for r in group_results if r["hard_hourly_exceeded"])
+        hard_daily_count = sum(1 for r in group_results if r["hard_daily_exceeded"])
+
+        flags = []
+        if soft_hourly_count:
+            flags.append(f"SOFT-1H:{soft_hourly_count}keys")
+        if soft_daily_count:
+            flags.append(f"SOFT-24H:{soft_daily_count}keys")
+        if hard_hourly_count:
+            flags.append(f"HARD-1H:{hard_hourly_count}keys")
+        if hard_daily_count:
+            flags.append(f"HARD-24H:{hard_daily_count}keys")
+
+        status = ", ".join(flags) if flags else "OK"
+        h_part = (
+            f"1h=${total_hourly:.4f}"
+            f"{'/' + f'${group.limits.hourly:.2f}' if group.limits.hourly else ''}"
+            if not skip_hourly else "1h=n/a (first run)"
+        )
+        print(
+            f"[poll] {group_name} ({len(group_results)} keys):  "
+            f"{h_part}  "
+            f"24h=${total_daily:.4f}"
+            f"{'/' + f'${group.limits.daily:.2f}' if group.limits.daily else ''}  "
+            f"[{status}]"
+        )
 
 
 def _print_top_keys(db: WatchdogDB, client: UsageClient, limit: int = 5, has_org_admin: bool = False) -> None:

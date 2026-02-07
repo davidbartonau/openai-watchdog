@@ -7,7 +7,7 @@ limits, and alert you before bills get out of control.
 
 - **Rolling spend limits** — set hourly and daily dollar limits per API key group
 - **Soft + hard enforcement** — email warnings at the soft limit; automatically
-  restrict keys at the hard limit (150% of soft by default)
+  DELETE keys at the hard limit (300% of soft by default)
 - **Periodic polling** — runs every 10 minutes (configurable), stores costs in
   a local SQLite database, and checks rolling 1-hour / 24-hour windows
 - **Top spenders report** — after each poll, prints the top N most expensive API keys
@@ -110,7 +110,7 @@ key_groups:
     limits:
       hourly: 20.0           # soft limit: $20/hour
       daily: 30.0            # soft limit: $30/day
-      hard_multiplier: 1.5   # hard limit = soft * 1.5
+      hard_multiplier: 3.0   # hard limit = soft * 3.0
 
   team-beta:
     api_key_ids:
@@ -159,7 +159,7 @@ export:
 | `key_groups.<name>.owner_email` | Email for soft-limit notifications | (optional) |
 | `key_groups.<name>.limits.hourly` | Soft hourly spend limit in USD | (optional) |
 | `key_groups.<name>.limits.daily` | Soft daily spend limit in USD | (optional) |
-| `key_groups.<name>.limits.hard_multiplier` | Hard limit = soft * this | `1.5` |
+| `key_groups.<name>.limits.hard_multiplier` | Hard limit = soft * this | `3.0` |
 | `alerts.stdout` | Print alerts to stderr | `true` |
 | `alerts.webhook_url` | POST JSON alerts to this URL | (optional) |
 | `alerts.email.smtp_host` | SMTP server hostname | (optional) |
@@ -203,7 +203,7 @@ For production use, run the poller as a cron job:
 The `--once` flag runs a single poll cycle and exits.  Exit codes:
 - `0` — all groups within limits
 - `1` — at least one soft limit exceeded
-- `2` — at least one hard limit exceeded (keys were restricted)
+- `2` — at least one hard limit exceeded (keys were deleted)
 
 ### Running as a daemon
 
@@ -232,12 +232,12 @@ For each key group, limits are checked against rolling windows:
 |---|---|---|---|
 | Soft hourly | Last 1h | `limits.hourly` | Email owner + alert |
 | Soft daily | Last 24h | `limits.daily` | Email owner + alert |
-| Hard hourly | Last 1h | `hourly * 1.5` | **Restrict keys** + email + alert |
-| Hard daily | Last 24h | `daily * 1.5` | **Restrict keys** + email + alert |
+| Hard hourly | Last 1h | `hourly * 3.0` | **DELETE key** + email + alert |
+| Hard daily | Last 24h | `daily * 3.0` | **DELETE key** + email + alert |
 
 **Example:** `hourly: 20.0, daily: 30.0`
 - Soft limits: $20/hour, $30/day
-- Hard limits: $30/hour (150%), $45/day (150%)
+- Hard limits: $60/hour (300%), $90/day (300%)
 
 ## Organization admin permissions
 
@@ -248,13 +248,13 @@ Set `has_org_admin: true` in your config to enable these features:
 |---|---|
 | Show key names and owner emails in top-N report | Yes |
 | Use `default: true` to catch all unassigned keys | Yes |
-| Disable/restrict keys when hard limits are hit | Yes |
+| Delete keys when hard limits are hit | Yes |
 | Basic usage monitoring and alerts | No |
 
 To create an Admin API key with management permissions:
 1. Go to https://platform.openai.com/settings/organization/admin-keys
 2. Create a new key with the `api.management.read` scope (and `api.management.write`
-   if you want automatic key restriction on hard limit breach)
+   if you want automatic key deletion on hard limit breach)
 
 ## Email alerts
 
@@ -292,25 +292,24 @@ key_groups:
 **What gets emailed:**
 
 - **Soft limit breach:** a warning email telling the owner their spend is over
-  the limit, and what the hard limit is (at which point keys get restricted).
-- **Hard limit breach:** a notification that keys have been restricted, with
-  instructions to contact an admin to restore access.
+  the limit, and what the hard limit is (at which point keys get deleted).
+- **Hard limit breach:** a notification that keys have been deleted, with
+  instructions to contact an admin to create new keys.
 
 Alerts have a **1-hour cooldown** per group per alert type — you won't get
 spammed with the same alert every 10 minutes.
 
-## Key restriction (hard limit enforcement)
+## Key deletion (hard limit enforcement)
 
-When a hard limit is breached, the watchdog uses the OpenAI Admin API to
-restrict each API key in the group:
+When a hard limit is breached (default: 300% of soft limit), the watchdog
+uses the OpenAI Admin API to DELETE the offending API key:
 
-- Calls `POST /v1/organization/api_keys/{key_id}` to rename the key with a
-  `[RESTRICTED by watchdog]` prefix
-- Sends an email to the key owner notifying them of the restriction
+- Calls `DELETE /v1/organization/api_keys/{key_id}` to permanently delete the key
+- Sends an email to the key owner notifying them of the deletion
 - Posts to the configured webhook URL
 
-To restore a restricted key, an admin can use the `restore_api_key()` function
-or manually rename the key in the OpenAI dashboard.
+**Note:** OpenAI does not provide a way to disable keys — they can only be
+deleted. To restore access, an admin must create a new API key.
 
 ## Database
 
@@ -453,7 +452,7 @@ openai_watchdog/
   cli.py               # CLI entry point and argument parsing
   config.py            # YAML configuration loader and schema
   db.py                # SQLite database layer
-  enforcement.py       # Soft/hard limit enforcement (email, key restriction)
+  enforcement.py       # Soft/hard limit enforcement (email, key deletion)
   export.py            # CSV/JSON report export
   monitor.py           # Key-group usage aggregation
   poller.py            # Periodic poll cycle logic

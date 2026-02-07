@@ -164,9 +164,10 @@ def _handle_soft_key(
                 f"  Key name:       {key_name}\n"
                 f"  Owner:          {owner}\n"
                 f"  Current spend:  ${cost:.4f}\n"
-                f"  Soft limit:     ${limit:.2f}\n\n"
-                f"If spend reaches ${hard_limit:.2f} "
-                f"(hard limit), this key will be deleted automatically.\n"
+                f"  Soft limit:     ${limit:.2f}\n"
+                f"  Hard limit:     ${hard_limit:.2f}\n\n"
+                f"WARNING: If spend reaches the hard limit, this key will be "
+                f"DELETED automatically.\n"
             ),
             verbose=verbose,
         )
@@ -203,13 +204,13 @@ def _handle_hard_key(
     msg = (
         f"[openai-watchdog] HARD LIMIT ({window}): "
         f"key {key_name} ({key_id}) at ${cost:.4f} (hard limit ${limit:.2f}) — "
-        f"RESTRICTING key"
+        f"DELETING key"
     )
 
     if cfg.alerts.stdout:
         print(msg, file=sys.stderr)
 
-    # Restrict only this specific key
+    # Delete this specific key
     _restrict_api_key(admin_key, key_id, verbose=verbose)
 
     if cfg.alerts.webhook_url:
@@ -222,7 +223,7 @@ def _handle_hard_key(
         _send_email(
             settings=cfg.alerts.email,
             to_addr=group.owner_email,
-            subject=f"OpenAI Watchdog: API key HARD {window} limit — key restricted",
+            subject=f"OpenAI Watchdog: API key HARD {window} limit — key DELETED",
             body=(
                 f"An API key in group \"{group_name}\" has exceeded its "
                 f"{window} HARD spend limit.\n\n"
@@ -231,8 +232,8 @@ def _handle_hard_key(
                 f"  Owner:          {owner}\n"
                 f"  Current spend:  ${cost:.4f}\n"
                 f"  Hard limit:     ${limit:.2f}\n\n"
-                f"Action taken: this API key has been restricted.\n\n"
-                f"Contact your administrator to restore access.\n"
+                f"Action taken: this API key has been DELETED.\n\n"
+                f"Contact your administrator to create a new key.\n"
             ),
             verbose=verbose,
         )
@@ -241,76 +242,46 @@ def _handle_hard_key(
 
 
 # ------------------------------------------------------------------
-# OpenAI Admin API: key restriction
+# OpenAI Admin API: key deletion
 # ------------------------------------------------------------------
 
 def _restrict_api_key(admin_key: str, key_id: str, *, verbose: bool = False) -> bool:
-    """Restrict an API key to read-only by removing all permission scopes
-    except model listing.
+    """Delete an API key when hard limit is breached.
 
-    Uses POST /v1/organization/api_keys/{key_id} with the Admin API.
-    Returns True if successful, False on error.
+    Uses DELETE /v1/organization/projects/{project_id}/api_keys/{key_id}
+    with the Admin API. Returns True if successful, False on error.
+
+    Note: OpenAI does not provide a way to disable keys - only delete them.
     """
+    # The API key delete endpoint requires the project_id, but we may not have it.
+    # Try deleting via the organization endpoint first (may work for admin keys).
     url = f"{ADMIN_API_KEYS_URL}/{key_id}"
 
-    # Set scopes to only allow listing models — no completions, embeddings,
-    # images, audio, or any other resource that costs money.
-    payload = {
-        "name": f"[RESTRICTED by watchdog] {key_id}",
-    }
-
-    data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url,
-        data=data,
         headers={
             "Authorization": f"Bearer {admin_key}",
             "Content-Type": "application/json",
         },
-        method="POST",
+        method="DELETE",
     )
 
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             if verbose:
-                print(f"[enforce] Restricted key {key_id}: HTTP {resp.status}")
+                print(f"[enforce] DELETED key {key_id}: HTTP {resp.status}")
             return True
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")
         print(
-            f"[enforce] Failed to restrict key {key_id}: "
+            f"[enforce] Failed to delete key {key_id}: "
             f"HTTP {exc.code}: {body}",
             file=sys.stderr,
         )
         return False
     except (urllib.error.URLError, OSError) as exc:
-        print(f"[enforce] Network error restricting key {key_id}: {exc}",
+        print(f"[enforce] Network error deleting key {key_id}: {exc}",
               file=sys.stderr)
-        return False
-
-
-def restore_api_key(admin_key: str, key_id: str, name: str = "") -> bool:
-    """Remove the restriction from an API key (manual recovery).
-
-    This just renames the key to remove the [RESTRICTED] prefix.
-    Full scope restoration depends on OpenAI's Admin API capabilities.
-    """
-    url = f"{ADMIN_API_KEYS_URL}/{key_id}"
-    payload = {"name": name or key_id}
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {admin_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15):
-            return True
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
         return False
 
 

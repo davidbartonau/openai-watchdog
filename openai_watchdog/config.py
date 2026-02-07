@@ -57,8 +57,8 @@ import yaml
 
 DEFAULT_CONFIG_PATHS = ("watchdog.yaml", "watchdog.yml")
 
-# Hard limit defaults to 150% of the soft limit.
-DEFAULT_HARD_MULTIPLIER = 1.5
+# Hard limit defaults to 300% of the soft limit.
+DEFAULT_HARD_MULTIPLIER = 3.0
 
 
 @dataclass

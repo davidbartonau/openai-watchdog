@@ -158,9 +158,9 @@ def run_poll_cycle(
     if verbose:
         _print_group_summaries(results, cfg, skip_hourly=first_run)
 
-    # Print top N most expensive keys (last 24h).
+    # Print top N most expensive keys with interval/1h/24h costs.
     if verbose and show_top > 0:
-        _print_top_keys(db, client, show_top, has_org_admin)
+        _print_top_keys(db, client, show_top, has_org_admin, poll_start)
 
     # Run enforcement (emails, key restriction).
     enforce_limits(results, cfg, db, client, verbose=verbose)
@@ -272,21 +272,32 @@ def _print_group_summaries(
         )
 
 
-def _print_top_keys(db: WatchdogDB, client: UsageClient, limit: int = 5, has_org_admin: bool = False) -> None:
-    """Print the N most expensive API keys in the last 24 hours."""
+def _print_top_keys(
+    db: WatchdogDB,
+    client: UsageClient,
+    limit: int = 5,
+    has_org_admin: bool = False,
+    poll_ts: int = 0,
+) -> None:
+    """Print the N most expensive API keys with interval/1h/24h costs."""
     top = db.top_keys_by_cost(window_seconds=86400, limit=limit)
     if not top:
         return
-    print(f"[poll] Top {limit} keys by cost (24h):")
+    print(f"[poll] Top {limit} keys by cost:")
 
     if has_org_admin:
-        print(f"[poll]   {'#':<3s} {'Key ID':<25s} {'Name':<22s} {'Owner':<28s} {'Cost':>10s}")
-        print(f"[poll]   {'-'*3} {'-'*25} {'-'*22} {'-'*28} {'-'*10}")
+        print(f"[poll]   {'#':<3s} {'Key ID':<25s} {'Name':<20s} {'Interval':>10s} {'1h':>10s} {'24h':>10s}")
+        print(f"[poll]   {'-'*3} {'-'*25} {'-'*20} {'-'*10} {'-'*10} {'-'*10}")
     else:
-        print(f"[poll]   {'#':<3s} {'Key ID':<25s} {'Cost':>10s}")
-        print(f"[poll]   {'-'*3} {'-'*25} {'-'*10}")
+        print(f"[poll]   {'#':<3s} {'Key ID':<25s} {'Interval':>10s} {'1h':>10s} {'24h':>10s}")
+        print(f"[poll]   {'-'*3} {'-'*25} {'-'*10} {'-'*10} {'-'*10}")
 
-    for i, (key_id, group_name, cost) in enumerate(top, 1):
+    for i, (key_id, group_name, daily_cost) in enumerate(top, 1):
+        # Get costs for different windows
+        hourly_cost = db.rolling_key_cost_hourly(key_id)
+        # Interval cost: cost recorded at the current poll timestamp
+        interval_cost = _get_key_interval_cost(db, key_id, poll_ts)
+
         # Truncate key ID for display (show first 12 + last 4 chars).
         if len(key_id) > 23:
             display_key = key_id[:12] + "..." + key_id[-6:]
@@ -296,9 +307,23 @@ def _print_top_keys(db: WatchdogDB, client: UsageClient, limit: int = 5, has_org
         if has_org_admin:
             # Get key metadata from cache or API
             info = client.get_key_info(key_id)
-            name = info.name[:20] + ".." if len(info.name) > 22 else info.name
-            owner = info.owner_email or info.owner_name or "-"
-            owner = owner[:26] + ".." if len(owner) > 28 else owner
-            print(f"[poll]   {i:<3d} {display_key:<25s} {name:<22s} {owner:<28s} ${cost:>9.4f}")
+            name = info.name[:18] + ".." if len(info.name) > 20 else info.name
+            print(
+                f"[poll]   {i:<3d} {display_key:<25s} {name:<20s} "
+                f"${interval_cost:>9.4f} ${hourly_cost:>9.4f} ${daily_cost:>9.4f}"
+            )
         else:
-            print(f"[poll]   {i:<3d} {display_key:<25s} ${cost:>9.4f}")
+            print(
+                f"[poll]   {i:<3d} {display_key:<25s} "
+                f"${interval_cost:>9.4f} ${hourly_cost:>9.4f} ${daily_cost:>9.4f}"
+            )
+
+
+def _get_key_interval_cost(db: WatchdogDB, key_id: str, poll_ts: int) -> float:
+    """Get the cost for a specific key at a specific poll timestamp."""
+    row = db.conn.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM key_costs "
+        "WHERE api_key_id = ? AND poll_ts = ?",
+        (key_id, poll_ts),
+    ).fetchone()
+    return row[0] if row else 0.0

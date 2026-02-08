@@ -286,8 +286,8 @@ def _print_top_keys(
     print(f"[poll] Top {limit} keys by cost:")
 
     if has_org_admin:
-        print(f"[poll]   {'#':<3s} {'Key ID':<25s} {'Name':<20s} {'Interval':>10s} {'1h':>10s} {'24h':>10s}")
-        print(f"[poll]   {'-'*3} {'-'*25} {'-'*20} {'-'*10} {'-'*10} {'-'*10}")
+        print(f"[poll]   {'#':<3s} {'Key ID':<20s} {'Name':<18s} {'Owner':<24s} {'Interval':>9s} {'1h':>9s} {'24h':>9s}")
+        print(f"[poll]   {'-'*3} {'-'*20} {'-'*18} {'-'*24} {'-'*9} {'-'*9} {'-'*9}")
     else:
         print(f"[poll]   {'#':<3s} {'Key ID':<25s} {'Interval':>10s} {'1h':>10s} {'24h':>10s}")
         print(f"[poll]   {'-'*3} {'-'*25} {'-'*10} {'-'*10} {'-'*10}")
@@ -298,19 +298,21 @@ def _print_top_keys(
         # Interval cost: cost recorded at the current poll timestamp
         interval_cost = _get_key_interval_cost(db, key_id, poll_ts)
 
-        # Truncate key ID for display (show first 12 + last 4 chars).
-        if len(key_id) > 23:
-            display_key = key_id[:12] + "..." + key_id[-6:]
+        # Truncate key ID for display
+        if len(key_id) > 18:
+            display_key = key_id[:10] + ".." + key_id[-6:]
         else:
             display_key = key_id
 
         if has_org_admin:
             # Get key metadata from cache or API
             info = client.get_key_info(key_id)
-            name = info.name[:18] + ".." if len(info.name) > 20 else info.name
+            name = info.name[:16] + ".." if len(info.name) > 18 else info.name
+            owner = info.owner_email or info.owner_name or "-"
+            owner = owner[:22] + ".." if len(owner) > 24 else owner
             print(
-                f"[poll]   {i:<3d} {display_key:<25s} {name:<20s} "
-                f"${interval_cost:>9.4f} ${hourly_cost:>9.4f} ${daily_cost:>9.4f}"
+                f"[poll]   {i:<3d} {display_key:<20s} {name:<18s} {owner:<24s} "
+                f"${interval_cost:>8.4f} ${hourly_cost:>8.4f} ${daily_cost:>8.4f}"
             )
         else:
             print(

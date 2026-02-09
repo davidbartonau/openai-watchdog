@@ -7,4 +7,6 @@ build/
 .env
 *.lock
 *.db
+*.db-shm
+*.db-wal
 reports/
